@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model EventConfig {
+  id                   String   @id @default("sss-2026")
+  name                 String
+  tagline              String
+  eventDate            DateTime @map("event_date")
+  registrationDeadline String   @map("registration_deadline")
+  venueName            String   @map("venue_name")
+  venueCity            String   @map("venue_city")
+  isRegistrationOpen   Boolean  @default(true) @map("is_registration_open")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("event_config")
+}
+
+model Category {
+  slug          String         @id
+  name          String
+  formLabel     String         @map("form_label")
+  minAge        Int            @map("min_age")
+  maxAge        Int            @map("max_age")
+  feePaise      Int            @map("fee_paise")
+  currency      String         @default("INR")
+  isActive      Boolean        @default(true) @map("is_active")
+  registrations Registration[]
+
+  @@map("categories")
+}
+
+model Registration {
+  id                    String          @id @default(uuid())
+  reference             String          @unique
+  categorySlug          String          @map("category_slug")
+  category              Category        @relation(fields: [categorySlug], references: [slug])
+  fullName              String          @map("full_name")
+  email                 String
+  phone                 String
+  dob                   DateTime
+  ageOnContest          Int             @map("age_on_contest")
+  occupation            String
+  city                  String
+  guardianName          String?         @map("guardian_name")
+  guardianPhone         String?         @map("guardian_phone")
+  amountPaise           Int             @map("amount_paise")
+  currency              String          @default("INR")
+  status                String          @default("AWAITING_PAYMENT")
+  createdAt             DateTime        @default(now()) @map("created_at")
+  updatedAt             DateTime        @updatedAt @map("updated_at")
+  payments              Payment[]
+  emailDeliveries       EmailDelivery[]
+
+  @@index([reference])
+  @@index([email])
+  @@index([phone])
+  @@index([status])
+  @@map("registrations")
+}
+
+model Payment {
+  id                    String       @id @default(uuid())
+  registrationId        String       @map("registration_id")
+  registration          Registration @relation(fields: [registrationId], references: [id])
+  registrationReference String       @map("registration_reference")
+  razorpayOrderId       String       @unique @map("razorpay_order_id")
+  razorpayPaymentId     String?      @unique @map("razorpay_payment_id")
+  razorpaySignature     String?      @map("razorpay_signature")
+  amountPaise           Int          @map("amount_paise")
+  currency              String       @default("INR")
+  status                String       @default("CREATED")
+  failureReason         String?      @map("failure_reason")
+  idempotencyKey        String?      @unique @map("idempotency_key")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  @@index([razorpayOrderId])
+  @@index([razorpayPaymentId])
+  @@index([registrationReference])
+  @@index([status])
+  @@map("payments")
+}
+
+model EmailDelivery {
+  id                    String       @id @default(uuid())
+  registrationId        String       @map("registration_id")
+  registration          Registration @relation(fields: [registrationId], references: [id])
+  registrationReference String       @map("registration_reference")
+  recipientEmail        String       @map("recipient_email")
+  emailType             String       @map("email_type")
+  subject               String
+  status                String       @default("PENDING")
+  attemptCount          Int          @default(0) @map("attempt_count")
+  lastAttemptAt         DateTime?    @map("last_attempt_at")
+  errorMessage          String?      @map("error_message")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  @@index([registrationId])
+  @@index([recipientEmail])
+  @@index([status])
+  @@map("email_deliveries")
+}

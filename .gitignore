@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+dist/
+.DS_Store
+powershell.cmd
+*.sqlite
+*.sqlite3
