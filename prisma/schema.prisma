@@ -53,15 +53,30 @@ model Registration {
   amountPaise           Int             @map("amount_paise")
   currency              String          @default("INR")
   status                String          @default("AWAITING_PAYMENT")
+  // Administrative fields, written only by the dashboard. Optional so every
+  // existing row stays valid and the public registration flow is untouched.
+  cancelledAt           DateTime?       @map("cancelled_at")
+  cancelReason          String?         @map("cancel_reason")
+  checkedInAt           DateTime?       @map("checked_in_at")
+  checkedInBy           String?         @map("checked_in_by")
+  couponId              String?         @map("coupon_id")
+  coupon                Coupon?         @relation(fields: [couponId], references: [id])
+  couponCode            String?         @map("coupon_code")        // snapshot at apply time
+  baseAmountPaise       Int?            @map("base_amount_paise")  // null on pre-coupon rows
+  discountPaise         Int             @default(0) @map("discount_paise")
   createdAt             DateTime        @default(now()) @map("created_at")
   updatedAt             DateTime        @updatedAt @map("updated_at")
   payments              Payment[]
   emailDeliveries       EmailDelivery[]
+  couponRedemptions     CouponRedemption[]
 
   @@index([reference])
   @@index([email])
   @@index([phone])
   @@index([status])
+  @@index([categorySlug])
+  @@index([couponId])
+  @@index([createdAt])
   @@map("registrations")
 }
 
@@ -76,6 +91,7 @@ model Payment {
   amountPaise           Int          @map("amount_paise")
   currency              String       @default("INR")
   status                String       @default("CREATED")
+  settlementMode        String?      @map("settlement_mode")    // null = RAZORPAY; 'COMPLIMENTARY'
   failureReason         String?      @map("failure_reason")
   idempotencyKey        String?      @unique @map("idempotency_key")
   createdAt             DateTime     @default(now()) @map("created_at")
@@ -108,3 +124,198 @@ model EmailDelivery {
   @@index([status])
   @@map("email_deliveries")
 }
+// ---------------------------------------------------------------------------
+// Administration (sss-admin dashboard)
+//
+// Added for the operations dashboard. Nothing here touches the public
+// registration or payment path: the tables are additive and the existing
+// models are unchanged apart from the back-relations below.
+// ---------------------------------------------------------------------------
+
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+}
+
+model AdminUser {
+  id                 String         @id @default(uuid())
+  email              String         @unique
+  name               String
+  role               AdminRole      @default(ADMIN)
+  // scrypt hash, stored as scrypt$N$r$p$salt$derivedKey. Never a plaintext field.
+  passwordHash       String         @map("password_hash")
+  mustChangePassword Boolean        @default(true) @map("must_change_password")
+  isActive           Boolean        @default(true) @map("is_active")
+  lastLoginAt        DateTime?      @map("last_login_at")
+  failedAttempts     Int            @default(0) @map("failed_attempts")
+  lockedUntil        DateTime?      @map("locked_until")
+  passwordChangedAt  DateTime?      @map("password_changed_at")
+  resetTokenHash     String?        @map("reset_token_hash")
+  resetTokenExpiresAt DateTime?     @map("reset_token_expires_at")
+  deletedAt          DateTime?      @map("deleted_at")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  sessions           AdminSession[]
+  auditLogs          AuditLog[]
+  notes              AdminNote[]
+
+  @@index([email])
+  @@index([role])
+  @@index([deletedAt])
+  @@map("admin_users")
+}
+
+model AdminSession {
+  id          String    @id @default(uuid())
+  adminUserId String    @map("admin_user_id")
+  adminUser   AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  // sha256 of the opaque session token. The token itself only ever exists in
+  // the HttpOnly cookie, so a database leak does not hand over live sessions.
+  tokenHash   String    @unique @map("token_hash")
+  // The CSRF token itself, not a hash of it: the dashboard has to be handed
+  // this value back after a page reload, and a hash cannot be un-hashed. It is
+  // not a credential on its own — it is useless without the session cookie,
+  // which IS stored hashed. Column name kept so no migration is needed.
+  csrfToken   String    @map("csrf_hash")
+  userAgent   String?   @map("user_agent")
+  ipAddress   String?   @map("ip_address")
+  expiresAt   DateTime  @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+  lastSeenAt  DateTime  @default(now()) @map("last_seen_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([adminUserId])
+  @@index([expiresAt])
+  @@map("admin_sessions")
+}
+
+model AuditLog {
+  id          String     @id @default(uuid())
+  adminUserId String?    @map("admin_user_id")
+  adminUser   AdminUser? @relation(fields: [adminUserId], references: [id], onDelete: SetNull)
+  actorEmail  String     @map("actor_email")
+  action      String
+  entityType  String?    @map("entity_type")
+  entityId    String?    @map("entity_id")
+  outcome     String     @default("SUCCESS")
+  // Small, non-sensitive context only. Never tokens, passwords or secrets.
+  metadata    Json?
+  ipAddress   String?    @map("ip_address")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([action])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+model AdminNote {
+  id                    String     @id @default(uuid())
+  registrationReference String     @map("registration_reference")
+  adminUserId           String?    @map("admin_user_id")
+  adminUser             AdminUser? @relation(fields: [adminUserId], references: [id], onDelete: SetNull)
+  authorEmail           String     @map("author_email")
+  body                  String
+  createdAt             DateTime   @default(now()) @map("created_at")
+
+  @@index([registrationReference])
+  @@map("admin_notes")
+}
+
+// ---------------------------------------------------------------------------
+// Coupon & Discount System
+//
+// Additive tables for promo codes, percentage discounts, category scopes,
+// usage caps, and reservation tracking.
+//
+// Every column added to existing tables is nullable or has a safe default, so
+// prisma db push remains strictly non-destructive. No DDL files or sql/ scripts
+// are used. Invariants such as atomic slot reservation, one-coupon-per-
+// registration, and non-negative counters are enforced at the application
+// boundary in services/coupons.js (see D4 in the design brief).
+// ---------------------------------------------------------------------------
+
+model Coupon {
+  id              String   @id @default(uuid())
+  // Normalised: uppercase, trimmed, no spaces or hyphens. The comparison key.
+  code            String   @unique
+  // What the operator typed, for display on receipts and in the dashboard.
+  displayCode     String   @map("display_code")
+  description     String?
+
+  discountType    String   @default("PERCENT") @map("discount_type") // PERCENT (FLAT reserved)
+  discountValue   Int      @map("discount_value")                    // percent, 1..100
+
+  // Empty array == every category, now and in future.
+  categorySlugs   String[] @map("category_slugs")
+
+  // null == unlimited.
+  maxRedemptions  Int?     @map("max_redemptions")
+  // Denormalised live claim count (RESERVED + CONSUMED). Ledger is
+  // coupon_redemptions. Written ONLY by the claim/release functions in
+  // services/coupons.js — there is no database constraint behind this, so a
+  // second writer anywhere would be an oversell bug. See D4.
+  redeemedCount   Int      @default(0) @map("redeemed_count")
+  // null == no per-person cap. Counted on normalised email.
+  perEmailLimit   Int?     @map("per_email_limit")
+
+  startsAt        DateTime? @map("starts_at")
+  expiresAt       DateTime? @map("expires_at")
+
+  // Operator intent only: ACTIVE | PAUSED. Expiry/exhaustion are derived at read.
+  status          String    @default("ACTIVE")
+  isArchived      Boolean   @default(false) @map("is_archived")
+  archivedAt      DateTime? @map("archived_at")
+
+  // Set for auto-generated batches so a run can be listed, exported and revoked
+  // as one unit.
+  batchId         String?  @map("batch_id")
+  batchLabel      String?  @map("batch_label")
+
+  createdByEmail  String?  @map("created_by_email")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  redemptions     CouponRedemption[]
+  registrations   Registration[]
+
+  @@index([code])
+  @@index([status])
+  @@index([batchId])
+  @@index([expiresAt])
+  @@index([createdAt])
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id                    String       @id @default(uuid())
+  couponId              String       @map("coupon_id")
+  coupon                Coupon       @relation(fields: [couponId], references: [id])
+  couponCode            String       @map("coupon_code")     // snapshot
+  registrationId        String       @map("registration_id")
+  registration          Registration @relation(fields: [registrationId], references: [id])
+  registrationReference String       @map("registration_reference")
+  // Normalised lowercase email, for per-person limits without a join.
+  email                 String
+  categorySlug          String       @map("category_slug")
+
+  baseAmountPaise       Int          @map("base_amount_paise")
+  discountPaise         Int          @map("discount_paise")
+  payableAmountPaise    Int          @map("payable_amount_paise")
+
+  status                String       @default("RESERVED")    // RESERVED|CONSUMED|RELEASED
+  reservedAt            DateTime     @default(now()) @map("reserved_at")
+  consumedAt            DateTime?    @map("consumed_at")
+  releasedAt            DateTime?    @map("released_at")
+  releaseReason         String?      @map("release_reason")
+
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  @@index([couponId, status])
+  @@index([registrationId])
+  @@index([email])
+  @@index([status, reservedAt])   // the sweeper's access path
+  @@map("coupon_redemptions")
+}
+

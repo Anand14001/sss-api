@@ -206,6 +206,102 @@ Generates a new Razorpay order if a payment was abandoned or failed, without re-
 
 ---
 
+## 6A. Administration API (`/api/v1/admin`)
+
+Serves the `sss-admin` operations dashboard. Every route below is behind
+server-side session authentication — the dashboard hiding a page is a
+convenience, not the control that keeps anyone out.
+
+### Security model
+
+| Concern | How it is handled |
+|---|---|
+| Password storage | scrypt (N=2^15, r=8, p=1), per-password salt, parameters stored in the hash so they can be raised later. Chosen over argon2/bcrypt because it needs no native build step, which cPanel does not reliably provide. |
+| Session | Opaque 256-bit token in an **HttpOnly** cookie. Only its SHA-256 is stored, so a database leak hands over no live sessions. 8-hour expiry, rolling. Revocable server-side. |
+| CSRF | Double-submit token: a readable `sss_admin_csrf` cookie echoed in an `x-csrf-token` header. Required on every non-GET admin route. |
+| Brute force | Login limiter of 10 per 15 minutes keyed on **IP + email** (so one attacker cannot lock the organisers out via a shared venue IP), successful sign-ins not counted; account lock for 15 minutes after 8 consecutive failures. |
+| Enumeration | Every failed sign-in returns one identical message, and an unknown address still costs a password verification so the timing does not differ. |
+| First use | The seeded account carries `mustChangePassword`; every data route returns `PASSWORD_CHANGE_REQUIRED` until it is replaced. |
+| Audit | Append-only `audit_logs`. No code path updates or deletes a row, and metadata is scrubbed of anything key-, token- or password-shaped before it is written. |
+
+### Authentication
+
+| Route | Purpose |
+|---|---|
+| `POST /admin/auth/login` | Sign in. Sets the session and CSRF cookies. |
+| `POST /admin/auth/logout` | Revoke the current session. |
+| `GET /admin/auth/me` | Current administrator, session metadata, password rules. |
+| `POST /admin/auth/change-password` | Change password; revokes all other sessions. |
+| `GET /admin/auth/sessions` | List this administrator's live sessions. |
+| `POST /admin/auth/sessions/revoke-others` | Sign out every other device. |
+
+### Data
+
+| Route | Purpose |
+|---|---|
+| `GET /admin/overview` | KPIs, trends, recent entries and attention items in one round trip. |
+| `GET /admin/trends?days=` | Daily registration and revenue series (7–180 days). |
+| `GET /admin/filters` | Status, category and occupation vocabulary. |
+| `GET /admin/registrations` | Paged list. `q`, `status`, `paymentStatus`, `category`, `city`, `from`, `to`, `sort`, `order`, `page`, `pageSize` (capped at 100). |
+| `GET /admin/registrations/:reference` | Full record with payments, emails, notes and audit trail. |
+| `POST /admin/registrations/:reference/notes` | Add an internal note. |
+| `POST /admin/registrations/:reference/cancel` | Cancel. Requires a reason, and `acknowledgeNoRefund` if already paid. |
+| `POST /admin/registrations/:reference/check-in` | Event-day attendance. Confirmed registrations only. |
+| `POST /admin/registrations/:reference/resend-confirmation` | Resend the confirmation email. |
+| `GET /admin/participants` | Confirmed entries as a directory. |
+| `GET /admin/participants/duplicates` | Repeated email/phone, as a review aid — nothing is merged. |
+| `GET /admin/payments` | Paged Razorpay orders. |
+| `POST /admin/payments/:orderId/reconcile` | **Ask Razorpay what happened** and record the answer. |
+| `GET /admin/categories` | Read-only categories with counts and revenue. |
+| `GET /admin/contest` | Event details and per-category check-in progress. |
+| `GET /admin/emails` | Confirmation-email delivery attempts. |
+| `GET /admin/audit` | Audit log, filterable by action, actor and date. |
+| `GET /admin/reports` | Available report definitions. |
+| `GET /admin/reports/:reportId/export` | CSV download. Honours the same filters. |
+| `GET /admin/settings` | Event configuration and service health. |
+
+### Financial integrity
+
+`POST /admin/payments/:orderId/reconcile` is the **only** route that can move a
+payment to `CAPTURED`, and the decision is Razorpay's, not the operator's. The
+server calls `orders.fetchPayments`, and updates the record only if the gateway
+reports a captured payment on that order **for the exact expected amount**. A
+different amount is reported back for a person to resolve, never reconciled —
+flipping the status would record a fee that was never agreed. Running it twice
+is safe, and a registration someone has cancelled is left cancelled.
+
+There is no route anywhere that marks a payment paid on an operator's say-so.
+Revenue figures count `CAPTURED` payments only.
+
+Refunds are **not** implemented. Cancelling a paid registration records the
+cancellation and keeps the payment history; any refund is issued separately in
+the Razorpay dashboard, and the API refuses the cancellation until the caller
+acknowledges that.
+
+### Reports
+
+`registrations`, `confirmed`, `event-day`, `pending-payments`, `collections`.
+
+Rows are pulled in keyset-paged batches rather than one query, so an export
+stays flat in memory as the contest fills up. Text beginning with `=`, `+`, `-`,
+`@` or a tab is prefixed with `'` so a spreadsheet cannot execute a
+participant's name as a formula. Output is CRLF with a UTF-8 BOM, without which
+Excel on Windows renders ₹ and Indian names as mojibake. Every export is
+audited with its filters and row count — but never the search term itself.
+
+### Administrator provisioning
+
+```bash
+npm run seed:admin                        # create; existing account left untouched
+npm run seed:admin -- --reset-password    # overwrite deliberately, revoke all sessions
+```
+
+Reads `ADMIN_BOOTSTRAP_EMAIL` and `ADMIN_BOOTSTRAP_PASSWORD` from the server
+environment. Nothing is hardcoded, and the script prints only the address it
+provisioned. Clear both variables once the real password has been set.
+
+---
+
 ## 7. cPanel Deployment Guide
 
 ### Option A: cPanel "Setup Node.js App" (Recommended)
@@ -286,3 +382,59 @@ pg_restore -d "postgres://user:password@host:5432/dbname?sslmode=require" -v sss
 - [ ] Set `NODE_ENV=production` in production `.env`.
 - [ ] Ensure HTTPS is active and SSL certificate is valid.
 - [ ] Verify test transaction with a small amount on Live mode and confirm receipt email.
+
+---
+
+## 12. Coupons and Discounts Module
+
+### 12.1 Overview & Architecture
+The coupon engine extends the event registration system with promotional discounts, bulk partnership vouchers, and 100% complimentary registration waivers.
+
+Money correctness and concurrency guarantees:
+- **Integer Paise Arithmetic:** All money amounts are stored in integer paise. Discounts round down (`Math.floor`), ensuring participant fees are never overcharged and financial ledgers balance to the single paisa.
+- **Authoritative Server Pricing:** Frontends never send monetary amounts. The server validates the coupon code, checks category eligibility, and prices the registration authoritatively.
+- **100% Complimentary Flow (D3):** 100% discount coupons bypass Razorpay completely (`order: null, freeRegistration: true`, `Payment.settlementMode = 'COMPLIMENTARY'`). Registrations confirm immediately at ₹0 without payment gateway interaction.
+
+### 12.2 Concurrency Invariants
+All concurrency guarantees are enforced purely in application code via Prisma interactive transactions (`services/coupons.js`):
+1. **Single Chokepoint Slot Claim (D4):** Every reservation must call `claimCouponSlot`. A coupon slot is claimed atomically via an atomic conditional increment:
+   ```javascript
+   prisma.coupon.updateMany({
+     where: { id: coupon.id, redeemedCount: { lt: maxRedemptions } },
+     data: { redeemedCount: { increment: 1 } }
+   });
+   ```
+2. **One Coupon Per Registration (D5):** Enforced via atomic lock-by-WHERE:
+   ```javascript
+   prisma.registration.updateMany({
+     where: { id: regId, couponId: null },
+     data: { couponId, couponCode, discountPaise }
+   });
+   ```
+3. **Clamped Releases:** On reservation expiration or cancellation, releases are clamped:
+   ```javascript
+   prisma.coupon.updateMany({
+     where: { id: couponId, redeemedCount: { gt: 0 } },
+     data: { redeemedCount: { decrement: 1 } }
+   });
+   ```
+   Ensuring `redeemedCount` never drops below 0.
+
+### 12.3 Reservation State Machine
+- When a participant applies a coupon during registration or on an `AWAITING_PAYMENT` booking, a slot is atomically held and recorded in `coupon_redemptions` as `status: 'RESERVED'`.
+- When Razorpay verification succeeds (or webhook `order.paid` arrives), `consumeCouponForRegistration` marks the redemption `CONSUMED` (idempotent).
+- If payment fails, registration is cancelled, or the reservation TTL lapses, `releaseCouponForRegistration` marks the redemption `RELEASED` and decrements `redeemedCount`.
+
+### 12.4 Environment Variables
+```env
+# Reservation TTL in minutes (default 30)
+COUPON_RESERVATION_TTL_MINUTES=30
+
+# Background sweeper interval in minutes (0 to disable background cron, default 0)
+COUPON_SWEEPER_INTERVAL_MINUTES=0
+```
+
+### 12.5 Maintenance & Sweeper Runbook
+- **Integrity Drift Check:** `GET /api/v1/admin/coupons/integrity` checks for counter drift between `coupon.redeemedCount` and the ledger of active reservations.
+- **Manual Sweeper Trigger:** `POST /api/v1/admin/coupons/sweep` finds any `RESERVED` redemptions older than `COUPON_RESERVATION_TTL_MINUTES` on unpaid registrations, transitions them to `RELEASED`, and decrements the coupon counter.
+- **Audit Logging:** Every coupon lifecycle event (`coupon.created`, `coupon.generated`, `coupon.updated`, `coupon.paused`, `coupon.resumed`, `coupon.deleted`, `coupon.archived`, `coupon.batch.archived`, `coupon.swept`) is permanently recorded in `audit_logs`.

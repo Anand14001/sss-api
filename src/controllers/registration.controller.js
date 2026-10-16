@@ -41,3 +41,35 @@ export async function retryPaymentHandler(req, res, next) {
     next(err);
   }
 }
+
+export async function applyCouponHandler(req, res, next) {
+  try {
+    const { reference } = req.params;
+    const { couponCode } = req.body || {};
+    if (!couponCode) {
+      return res.status(400).json({
+        success: false,
+        code: 'COUPON_VALIDATION_FAILED',
+        error: 'Coupon code is required.'
+      });
+    }
+
+    const { applyCouponToRegistration } = await import('../services/registration.js');
+    const result = await applyCouponToRegistration(reference, couponCode);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeCouponHandler(req, res, next) {
+  try {
+    const { reference } = req.params;
+    const { removeCouponFromRegistration } = await import('../services/registration.js');
+    const result = await removeCouponFromRegistration(reference);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+

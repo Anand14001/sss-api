@@ -34,7 +34,15 @@ export function setTransporter(transporter) {
  * Generates polished HTML & plain-text confirmation emails.
  */
 export function generateConfirmationEmailContent({ registration, payment }) {
-  const amountRupees = ((payment.amountPaise || payment.amount_paise) / 100).toFixed(0);
+  const basePaise = registration.baseAmountPaise ?? registration.amountPaise;
+  const discountPaise = registration.discountPaise || 0;
+  const paidPaise = payment.amountPaise ?? registration.amountPaise;
+  const isFree = payment.settlementMode === 'COMPLIMENTARY' || paidPaise === 0;
+
+  const baseRupees = (basePaise / 100).toFixed(0);
+  const discountRupees = (discountPaise / 100).toFixed(0);
+  const amountRupees = (paidPaise / 100).toFixed(0);
+
   const contactsHtml = EVENT_CONFIG.contacts
     .map((c) => `<strong>${c.name}:</strong> <a href="${c.tel}" style="color: #102E52; text-decoration: none;">${c.phone}</a>`)
     .join(' &nbsp;|&nbsp; ');
@@ -44,7 +52,48 @@ export function generateConfirmationEmailContent({ registration, payment }) {
 
   const fullName = registration.fullName || registration.full_name;
   const categorySlug = registration.categorySlug || registration.category_slug;
-  const paymentId = payment.razorpayPaymentId || payment.razorpay_payment_id || 'Verified';
+  const paymentId = isFree ? 'Complimentary' : (payment.razorpayPaymentId || payment.razorpay_payment_id || 'Verified');
+  const bookingUrl = `${(env.FRONTEND_URL || 'https://sss.eventsinfinite.com').replace(/\/$/, '')}/booking/${registration.reference}`;
+
+  // Breakdown rows for HTML
+  let breakdownRowsHtml = `
+    <tr style="border-bottom: 1px solid #F0EAE1;">
+      <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Registration Fee</td>
+      <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #102E52; text-align: right;">₹${baseRupees}</td>
+    </tr>
+  `;
+  if (discountPaise > 0 && registration.couponCode) {
+    breakdownRowsHtml += `
+    <tr style="border-bottom: 1px solid #F0EAE1;">
+      <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Coupon (${registration.couponCode})</td>
+      <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #2E7D32; text-align: right;">-₹${discountRupees}</td>
+    </tr>
+    `;
+  }
+  breakdownRowsHtml += `
+    <tr style="border-bottom: 1px solid #F0EAE1;">
+      <td style="padding: 10px 0; font-size: 14px; font-weight: 700; color: #102E52;">${isFree ? 'Payable' : 'Amount Paid'}</td>
+      <td style="padding: 10px 0; font-size: 14px; font-weight: 700; color: #102E52; text-align: right;">${isFree ? '₹0 — Complimentary' : `₹${amountRupees}`}</td>
+    </tr>
+  `;
+  if (!isFree) {
+    breakdownRowsHtml += `
+    <tr style="border-bottom: 1px solid #F0EAE1;">
+      <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Payment ID</td>
+      <td style="padding: 10px 0; font-size: 14px; font-family: monospace; color: #5F6775; text-align: right;">${paymentId}</td>
+    </tr>
+    `;
+  }
+
+  // Breakdown text
+  let breakdownText = `Registration Fee: ₹${baseRupees}\n`;
+  if (discountPaise > 0 && registration.couponCode) {
+    breakdownText += `Coupon (${registration.couponCode}): -₹${discountRupees}\n`;
+  }
+  breakdownText += `${isFree ? 'Payable: ₹0 — Complimentary' : `Amount Paid: ₹${amountRupees}`}\n`;
+  if (!isFree) {
+    breakdownText += `Payment ID: ${paymentId}\n`;
+  }
 
   const html = `
 <!DOCTYPE html>
@@ -52,7 +101,7 @@ export function generateConfirmationEmailContent({ registration, payment }) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Registration & Payment Confirmed — ${EVENT_CONFIG.name}</title>
+  <title>Registration ${isFree ? 'Confirmed (Complimentary)' : 'Confirmed'} — ${EVENT_CONFIG.name}</title>
 </head>
 <body style="margin: 0; padding: 0; background-color: #FAF7F1; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #102E52; line-height: 1.6;">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FAF7F1; padding: 30px 15px;">
@@ -67,7 +116,7 @@ export function generateConfirmationEmailContent({ registration, payment }) {
                 ${EVENT_CONFIG.shortName}
               </h1>
               <p style="margin: 6px 0 0 0; color: #E7C27A; font-size: 14px; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600;">
-                Registration & Payment Confirmed
+                ${isFree ? 'Registration Confirmed (Complimentary)' : 'Registration & Payment Confirmed'}
               </p>
             </td>
           </tr>
@@ -79,10 +128,12 @@ export function generateConfirmationEmailContent({ registration, payment }) {
                 Dear <strong>${fullName}</strong>,
               </p>
               <p style="margin: 0 0 24px 0; font-size: 15px; color: #5F6775;">
-                We are thrilled to confirm your registration for <strong>${EVENT_CONFIG.name}</strong>. Your payment has been received successfully.
+                ${isFree
+                  ? `We are thrilled to confirm your complimentary registration for <strong>${EVENT_CONFIG.name}</strong>.`
+                  : `We are thrilled to confirm your registration for <strong>${EVENT_CONFIG.name}</strong>. Your payment has been received successfully.`}
               </p>
 
-              <!-- Reference Badge -->
+              <!-- Reference Badge with Canonical Booking Link -->
               <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom: 24px; background-color: #F3EDE2; border-radius: 12px; border: 1px solid #E5DCCB;">
                 <tr>
                   <td style="padding: 16px 20px;">
@@ -91,6 +142,11 @@ export function generateConfirmationEmailContent({ registration, payment }) {
                     </div>
                     <div style="font-size: 24px; font-weight: 800; color: #102E52; letter-spacing: 0.5px; margin-top: 4px;">
                       ${registration.reference}
+                    </div>
+                    <div style="margin-top: 10px; font-size: 13px;">
+                      <a href="${bookingUrl}" style="color: #102E52; font-weight: 600; text-decoration: underline;">
+                        View your booking details &amp; receipt online &rarr;
+                      </a>
                     </div>
                   </td>
                 </tr>
@@ -106,14 +162,7 @@ export function generateConfirmationEmailContent({ registration, payment }) {
                   <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Category</td>
                   <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #102E52; text-align: right;">${categorySlug.toUpperCase()}</td>
                 </tr>
-                <tr style="border-bottom: 1px solid #F0EAE1;">
-                  <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Amount Paid</td>
-                  <td style="padding: 10px 0; font-size: 14px; font-weight: 700; color: #102E52; text-align: right;">₹${amountRupees}</td>
-                </tr>
-                <tr style="border-bottom: 1px solid #F0EAE1;">
-                  <td style="padding: 10px 0; font-size: 14px; color: #5F6775;">Payment ID</td>
-                  <td style="padding: 10px 0; font-size: 14px; font-family: monospace; color: #5F6775; text-align: right;">${paymentId}</td>
-                </tr>
+                ${breakdownRowsHtml}
               </table>
 
               <!-- Event Details -->
@@ -163,17 +212,21 @@ export function generateConfirmationEmailContent({ registration, payment }) {
 
   const text = `
 ${EVENT_CONFIG.name}
-Registration & Payment Confirmed
+${isFree ? 'Registration Confirmed (Complimentary)' : 'Registration & Payment Confirmed'}
 
 Dear ${fullName},
 
-Thank you for registering for ${EVENT_CONFIG.name}. Your payment of ₹${amountRupees} has been verified and your registration is confirmed.
+${isFree
+  ? `Thank you for registering for ${EVENT_CONFIG.name}. Your complimentary registration is confirmed.`
+  : `Thank you for registering for ${EVENT_CONFIG.name}. Your payment of ₹${amountRupees} has been verified and your registration is confirmed.`}
 
 REGISTRATION REFERENCE: ${registration.reference}
 Participant: ${fullName}
 Category: ${categorySlug.toUpperCase()}
-Amount Paid: ₹${amountRupees}
-Payment ID: ${paymentId}
+${breakdownText.trim()}
+
+BOOKING DETAILS & RECEIPT:
+${bookingUrl}
 
 EVENT DETAILS:
 Date: ${EVENT_CONFIG.dateDisplay}
@@ -194,15 +247,19 @@ Presented by Salem Parenting Club & Speak Up Salem Toastmasters Club
 /**
  * Sends a payment confirmation email, ensuring idempotent delivery and recording attempts.
  */
-export async function sendPaymentConfirmationEmail({ registration, payment }) {
-  // Check if confirmation already sent to avoid duplicate emails
-  const existingDelivery = await prisma.emailDelivery.findFirst({
-    where: {
-      registrationId: registration.id,
-      emailType: 'PAYMENT_CONFIRMATION',
-      status: 'SENT'
-    }
-  });
+export async function sendPaymentConfirmationEmail({ registration, payment, force = false }) {
+  // Check if confirmation already sent to avoid duplicate emails. `force` is set
+  // only by an administrator deliberately resending from the dashboard, where
+  // the duplicate is the point; the automatic paths never set it.
+  const existingDelivery = force
+    ? null
+    : await prisma.emailDelivery.findFirst({
+        where: {
+          registrationId: registration.id,
+          emailType: 'PAYMENT_CONFIRMATION',
+          status: 'SENT'
+        }
+      });
 
   if (existingDelivery) {
     return { skipped: true, reason: 'Already sent' };
@@ -272,3 +329,33 @@ export async function sendPaymentConfirmationEmail({ registration, payment }) {
     return { success: false, error: safeError };
   }
 }
+
+export async function sendPasswordResetEmail({ toEmail, name, resetLink }) {
+  const transporter = getTransporter();
+  if (!transporter) {
+    return { accepted: false, simulated: true };
+  }
+  try {
+    const info = await transporter.sendMail({
+      from: `"${env.MAIL_FROM_NAME}" <${env.MAIL_FROM_ADDRESS}>`,
+      to: toEmail,
+      subject: 'Salem Star Speaker Admin - Password Reset',
+      text: `Hello ${name},\n\nA password reset request was initiated for your Salem Star Speaker admin account.\n\nPlease visit the following link to set a new password:\n${resetLink}\n\nThis link is single-use and will expire in 24 hours.\n\nIf you did not request this, please contact your administrator.`,
+      html: `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #102E52;">
+        <h2>Salem Star Speaker — Admin Password Reset</h2>
+        <p>Hello ${name},</p>
+        <p>A password reset request was initiated for your Salem Star Speaker admin account.</p>
+        <p style="margin: 24px 0;">
+          <a href="${resetLink}" style="background-color: #102E52; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold; display: inline-block;">Set New Password</a>
+        </p>
+        <p style="color: #666; font-size: 13px;">If the button does not work, copy and paste this link into your browser:<br/><a href="${resetLink}">${resetLink}</a></p>
+        <p style="color: #666; font-size: 12px;">This link is single-use and valid for 24 hours.</p>
+      </div>`
+    });
+    return { accepted: true, messageId: info.messageId };
+  } catch (err) {
+    console.error('[EMAIL] Failed to send password reset email:', err.message);
+    return { accepted: false, error: err.message };
+  }
+}
+

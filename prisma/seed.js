@@ -54,6 +54,29 @@ export async function seed() {
     });
   }
 
+  // Ensure initial Super Administrator admin@digitaldude.com is seeded with SUPER_ADMIN role idempotently
+  const targetEmail = 'admin@digitaldude.com';
+  const existingAdmin = await prisma.adminUser.findUnique({
+    where: { email: targetEmail }
+  });
+
+  if (existingAdmin) {
+    if (existingAdmin.role !== 'SUPER_ADMIN') {
+      await prisma.adminUser.update({
+        where: { email: targetEmail },
+        data: { role: 'SUPER_ADMIN' }
+      });
+      console.log(`[SEED] Updated ${targetEmail} to SUPER_ADMIN.`);
+    }
+  } else {
+    try {
+      const { seedAdmin } = await import('./seedAdmin.js');
+      await seedAdmin({ reset: false });
+    } catch (err) {
+      console.warn(`[SEED] Note: Could not auto-provision ${targetEmail}: ${err.message}`);
+    }
+  }
+
   console.log('Seeded event configuration and categories successfully.');
 }
 
