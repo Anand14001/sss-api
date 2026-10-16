@@ -19,35 +19,34 @@ import {
 describe('Pricing (quotePrice)', () => {
   test('returns full price with zero discount when no coupon is provided', () => {
     const quote = quotePrice({ categorySlug: 'kid' });
-    assert.equal(quote.baseAmountPaise, 9900);
+    assert.equal(quote.baseAmountPaise, 25000);
     assert.equal(quote.discountPaise, 0);
-    assert.equal(quote.payableAmountPaise, 9900);
+    assert.equal(quote.payableAmountPaise, 25000);
     assert.equal(quote.currency, 'INR');
   });
 
   test('floors percentage discounts in paise (never rounds up)', () => {
-    // 25% of 19900 paise = 4975 paise exactly
+    // 25% of 25000 paise = 6250 paise exactly
     const q1 = quotePrice({ categorySlug: 'teen', coupon: { discountType: 'PERCENT', discountValue: 25 } });
-    assert.equal(q1.baseAmountPaise, 19900);
-    assert.equal(q1.discountPaise, 4975);
-    assert.equal(q1.payableAmountPaise, 14925);
+    assert.equal(q1.baseAmountPaise, 25000);
+    assert.equal(q1.discountPaise, 6250);
+    assert.equal(q1.payableAmountPaise, 18750);
 
-    // 33% of 9900 paise: 9900 * 0.33 = 3267 paise
+    // 33% of 25000 paise: 25000 * 0.33 = 8250 paise
     const q2 = quotePrice({ categorySlug: 'kid', coupon: { discountType: 'PERCENT', discountValue: 33 } });
-    assert.equal(q2.discountPaise, 3267);
-    assert.equal(q2.payableAmountPaise, 6633);
+    assert.equal(q2.discountPaise, 8250);
+    assert.equal(q2.payableAmountPaise, 16750);
 
-    // 17% of 29900 paise = 5083 paise (exact Math.floor of 5083.00)
-    // 1% of 9900 paise = 99 paise
+    // 1% of 25000 paise = 250 paise
     const q3 = quotePrice({ categorySlug: 'kid', coupon: { discountType: 'PERCENT', discountValue: 1 } });
-    assert.equal(q3.discountPaise, 99);
-    assert.equal(q3.payableAmountPaise, 9801);
+    assert.equal(q3.discountPaise, 250);
+    assert.equal(q3.payableAmountPaise, 24750);
   });
 
   test('100% discount produces 0 payableAmountPaise', () => {
     const qAdult = quotePrice({ categorySlug: 'adult', coupon: { discountType: 'PERCENT', discountValue: 100 } });
-    assert.equal(qAdult.baseAmountPaise, 29900);
-    assert.equal(qAdult.discountPaise, 29900);
+    assert.equal(qAdult.baseAmountPaise, 25000);
+    assert.equal(qAdult.discountPaise, 25000);
     assert.equal(qAdult.payableAmountPaise, 0);
   });
 
@@ -318,7 +317,7 @@ describe('Redemption rules evaluation order', () => {
     });
     assert.equal(r25.valid, true);
     assert.equal(r25.isFree, false);
-    assert.equal(r25.quote.payableAmountPaise, 14925);
+    assert.equal(r25.quote.payableAmountPaise, 18750);
 
     const r100 = evaluateRedemptionRules({
       coupon: { ...baseCoupon, discountValue: 100 },

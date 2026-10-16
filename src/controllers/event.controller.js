@@ -19,17 +19,37 @@ export async function getHealth(req, res) {
 }
 
 export async function getPublicEventConfig(req, res) {
-  // Format categories as public array
-  const categoryList = Object.values(CATEGORIES).map((c) => ({
-    slug: c.slug,
-    name: c.name,
-    formLabel: c.formLabel,
-    minAge: c.minAge,
-    maxAge: c.maxAge,
-    fee: c.feeRupees,
-    feePaise: c.feePaise,
-    currency: c.currency
-  }));
+  let dbCategories = [];
+  try {
+    dbCategories = await prisma.category.findMany({
+      orderBy: { minAge: 'asc' }
+    });
+  } catch (err) {
+    console.error('Failed to query categories in getPublicEventConfig:', err.message);
+  }
+
+  // Set cache prevention headers so clients always receive fresh pricing without stale cache
+  res.set({
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+
+  // Format categories as public array using DB as authoritative source
+  const categoryList = (dbCategories.length > 0 ? dbCategories : Object.values(CATEGORIES)).map((row) => {
+    const staticCfg = CATEGORIES[row.slug?.toLowerCase()] || CATEGORIES[row.slug] || {};
+    const feePaise = row.feePaise !== undefined ? row.feePaise : (staticCfg.feePaise ?? 0);
+    return {
+      slug: row.slug,
+      name: row.name ?? staticCfg.name,
+      formLabel: row.formLabel ?? staticCfg.formLabel,
+      minAge: row.minAge ?? staticCfg.minAge,
+      maxAge: row.maxAge ?? staticCfg.maxAge,
+      fee: Math.floor(feePaise / 100),
+      feePaise,
+      currency: row.currency ?? staticCfg.currency ?? 'INR'
+    };
+  });
 
   res.json({
     success: true,
@@ -44,7 +64,8 @@ export async function getPublicEventConfig(req, res) {
       organisers: EVENT_CONFIG.organisers,
       contacts: EVENT_CONFIG.contacts,
       prizes: EVENT_CONFIG.prizes,
-      prelims: EVENT_CONFIG.prelims
+      prelims: EVENT_CONFIG.prelims,
+      whatsappGroupInviteUrl: EVENT_CONFIG.whatsappGroupInviteUrl
     },
     categories: categoryList
   });

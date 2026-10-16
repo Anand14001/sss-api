@@ -24,7 +24,7 @@ async function startServer() {
       console.warn('[DB SEED] Seed warning:', seedErr.message);
     }
 
-    const server = app.listen(PORT, () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`[SERVER] Salem Star Speaker API listening on port ${PORT} (${env.NODE_ENV})`);
     });
 

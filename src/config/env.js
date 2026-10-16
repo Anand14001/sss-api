@@ -44,12 +44,12 @@ export const env = {
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
     : [
-        'https://opt.eventsinfinite.com',
-        'https://sss.eventsinfinite.com',
-        'http://localhost:5173',
-        'http://localhost:3000',
-        'http://127.0.0.1:5173'
-      ],
+      'https://opt.eventsinfinite.com',
+      'https://sss.eventsinfinite.com',
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'http://127.0.0.1:5173'
+    ],
 
   // Public frontend URL for booking links in emails
   FRONTEND_URL: process.env.FRONTEND_URL || 'https://sss.eventsinfinite.com',

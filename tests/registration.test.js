@@ -30,16 +30,16 @@ test('Registration API Endpoints', async (t) => {
     const teen = res.body.categories.find((c) => c.slug === 'teen');
     const adult = res.body.categories.find((c) => c.slug === 'adult');
 
-    assert.strictEqual(kid.fee, 99);
-    assert.strictEqual(kid.feePaise, 9900);
-    assert.strictEqual(teen.fee, 199);
-    assert.strictEqual(teen.feePaise, 19900);
-    assert.strictEqual(adult.fee, 299);
-    assert.strictEqual(adult.feePaise, 29900);
+    assert.strictEqual(kid.fee, 250);
+    assert.strictEqual(kid.feePaise, 25000);
+    assert.strictEqual(teen.fee, 250);
+    assert.strictEqual(teen.feePaise, 25000);
+    assert.strictEqual(adult.fee, 250);
+    assert.strictEqual(adult.feePaise, 25000);
   });
 
   await t.test('POST /api/v1/registrations creates registration and orders with authoritative pricing', async () => {
-    // Junior (Kid) registration -> ₹99 / 9900 paise
+    // Junior (Kid) registration -> ₹250 / 25000 paise
     const kidPayload = {
       fullName: 'Meera Krishnan',
       email: `meera_${Date.now()}_${Math.floor(Math.random() * 1000)}@example.com`,
@@ -48,6 +48,10 @@ test('Registration API Endpoints', async (t) => {
       dob: '2014-06-15', // Age 12
       occupation: 'Student',
       city: 'Salem',
+      guardianName: 'Mrs. Krishnan',
+      guardianRelationship: 'Mother',
+      guardianPhone: '9876543211',
+      guardianEmail: 'krishnan.parent@example.com',
       // Attacker tries to pass fake amount
       amount: 10,
       feePaise: 100
@@ -62,9 +66,9 @@ test('Registration API Endpoints', async (t) => {
     assert.ok(res.body.registration.reference.startsWith('SSS-2026-'));
     assert.strictEqual(res.body.registration.status, 'AWAITING_PAYMENT');
     // Verify client-supplied fee was ignored and authoritative fee was applied
-    assert.strictEqual(res.body.registration.amountRupees, 99);
-    assert.strictEqual(res.body.registration.amountPaise, 9900);
-    assert.strictEqual(res.body.order.amount, 9900);
+    assert.strictEqual(res.body.registration.amountRupees, 250);
+    assert.strictEqual(res.body.registration.amountPaise, 25000);
+    assert.strictEqual(res.body.order.amount, 25000);
     assert.ok(res.body.order.id);
   });
 
@@ -98,15 +102,16 @@ test('Registration API Endpoints', async (t) => {
     assert.strictEqual(statusRes.status, 200);
     assert.strictEqual(statusRes.body.registration.reference, ref);
     assert.strictEqual(statusRes.body.registration.status, 'AWAITING_PAYMENT');
-    assert.strictEqual(statusRes.body.registration.amountRupees, 299);
+    assert.strictEqual(statusRes.body.registration.amountRupees, 250);
   });
 
   await t.test('POST /api/v1/registrations rejects registration when deadline has passed', async () => {
-    import('../src/config/event.js').then((module) => {
-      const originalDeadline = module.EVENT_CONFIG.deadline;
-      module.EVENT_CONFIG.deadline = '2020-01-01T00:00:00Z'; // Past deadline
-      
-      return request(app)
+    const module = await import('../src/config/event.js');
+    const originalDeadline = module.EVENT_CONFIG.deadline;
+    module.EVENT_CONFIG.deadline = '2020-01-01T00:00:00Z'; // Past deadline
+    
+    try {
+      const res = await request(app)
         .post('/api/v1/registrations')
         .send({
           fullName: 'Late Comers',
@@ -115,14 +120,17 @@ test('Registration API Endpoints', async (t) => {
           category: 'kid',
           dob: '2014-06-15',
           occupation: 'Student',
-          city: 'Salem'
-        })
-        .then((res) => {
-          module.EVENT_CONFIG.deadline = originalDeadline; // restore
-          assert.strictEqual(res.status, 400);
-          assert.strictEqual(res.body.code, 'DEADLINE_PASSED');
+          city: 'Salem',
+          guardianName: 'Late Parent',
+          guardianRelationship: 'Father',
+          guardianPhone: '9876543211',
+          guardianEmail: 'late.parent@example.com'
         });
-    });
+      assert.strictEqual(res.status, 400);
+      assert.strictEqual(res.body.code, 'DEADLINE_PASSED');
+    } finally {
+      module.EVENT_CONFIG.deadline = originalDeadline; // restore
+    }
   });
 });
 

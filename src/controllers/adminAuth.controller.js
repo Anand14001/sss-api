@@ -122,7 +122,7 @@ export async function logoutHandler(req, res, next) {
     if (req.admin) {
       await auditFromRequest(req, { action: AUDIT_ACTIONS.LOGOUT });
     }
-    clearSessionCookies(res);
+    clearSessionCookies(res, req);
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -210,7 +210,7 @@ export async function listSessionsHandler(req, res, next) {
   try {
     const sessions = await prisma.adminSession.findMany({
       where: { adminUserId: req.admin.id, revokedAt: null, expiresAt: { gt: new Date() } },
-      orderBy: { lastSeenAt: 'desc' },
+      orderBy: [{ lastSeenAt: 'desc' }, { id: 'desc' }],
       take: 25
     });
 

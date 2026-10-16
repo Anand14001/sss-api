@@ -37,7 +37,7 @@ export async function seed() {
         formLabel: cat.formLabel,
         minAge: cat.minAge,
         maxAge: cat.maxAge,
-        feePaise: cat.feePaise,
+        // feePaise is authoritative in the database; do not overwrite on seed/restart
         currency: cat.currency,
         isActive: true
       },

@@ -49,7 +49,9 @@ model Registration {
   occupation            String
   city                  String
   guardianName          String?         @map("guardian_name")
+  guardianRelationship  String?         @map("guardian_relationship")
   guardianPhone         String?         @map("guardian_phone")
+  guardianEmail         String?         @map("guardian_email")
   amountPaise           Int             @map("amount_paise")
   currency              String          @default("INR")
   status                String          @default("AWAITING_PAYMENT")
@@ -64,11 +66,18 @@ model Registration {
   couponCode            String?         @map("coupon_code")        // snapshot at apply time
   baseAmountPaise       Int?            @map("base_amount_paise")  // null on pre-coupon rows
   discountPaise         Int             @default(0) @map("discount_paise")
+  idempotencyKey        String?         @unique @map("idempotency_key")
+  // Review & application lifecycle
+  reviewDecision        String?         @map("review_decision")    // 'SHORTLISTED' | 'REJECTED'
+  reviewNotes           String?         @map("review_notes")
+  reviewedBy            String?         @map("reviewed_by")
+  reviewedAt            DateTime?       @map("reviewed_at")
   createdAt             DateTime        @default(now()) @map("created_at")
   updatedAt             DateTime        @updatedAt @map("updated_at")
   payments              Payment[]
   emailDeliveries       EmailDelivery[]
   couponRedemptions     CouponRedemption[]
+  paymentInvitations    PaymentInvitation[]
 
   @@index([reference])
   @@index([email])
@@ -76,8 +85,38 @@ model Registration {
   @@index([status])
   @@index([categorySlug])
   @@index([couponId])
+  @@index([reviewDecision])
   @@index([createdAt])
   @@map("registrations")
+}
+
+model PaymentInvitation {
+  id                    String       @id @default(uuid())
+  registrationId        String       @map("registration_id")
+  registration          Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  registrationReference String       @map("registration_reference")
+  token                 String       @unique
+  amountPaise           Int          @map("amount_paise")
+  currency              String       @default("INR")
+  status                String       @default("PENDING") // PENDING, SENT, FAILED, PAID, EXPIRED, CANCELLED
+  sentToEmail           String       @map("sent_to_email")
+  sentAt                DateTime?    @map("sent_at")
+  deliveryStatus        String       @default("PENDING") @map("delivery_status") // PENDING, SENT, FAILED
+  deliveryError         String?      @map("delivery_error")
+  expiresAt             DateTime     @map("expires_at")
+  paidAt                DateTime?    @map("paid_at")
+  razorpayOrderId       String?      @map("razorpay_order_id")
+  createdByAdminEmail   String?      @map("created_by_admin_email")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  @@index([registrationId])
+  @@index([registrationReference])
+  @@index([token])
+  @@index([status])
+  @@index([deliveryStatus])
+  @@index([createdAt])
+  @@map("payment_invitations")
 }
 
 model Payment {
@@ -101,6 +140,7 @@ model Payment {
   @@index([razorpayPaymentId])
   @@index([registrationReference])
   @@index([status])
+  @@index([createdAt])
   @@map("payments")
 }
 
@@ -122,6 +162,7 @@ model EmailDelivery {
   @@index([registrationId])
   @@index([recipientEmail])
   @@index([status])
+  @@index([createdAt])
   @@map("email_deliveries")
 }
 // ---------------------------------------------------------------------------
@@ -162,6 +203,7 @@ model AdminUser {
   @@index([email])
   @@index([role])
   @@index([deletedAt])
+  @@index([createdAt])
   @@map("admin_users")
 }
 
@@ -219,6 +261,7 @@ model AdminNote {
   createdAt             DateTime   @default(now()) @map("created_at")
 
   @@index([registrationReference])
+  @@index([createdAt])
   @@map("admin_notes")
 }
 
@@ -316,6 +359,7 @@ model CouponRedemption {
   @@index([registrationId])
   @@index([email])
   @@index([status, reservedAt])   // the sweeper's access path
+  @@index([createdAt])
   @@map("coupon_redemptions")
 }
 

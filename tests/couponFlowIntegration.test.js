@@ -71,7 +71,15 @@ describe('Coupon Flow Integration Tests', () => {
       category,
       dob: category === 'kid' ? '2014-06-15' : category === 'teen' ? '2010-06-15' : '1995-06-15',
       occupation: 'Student',
-      city: 'Salem'
+      city: 'Salem',
+      ...(category !== 'adult'
+        ? {
+            guardianName: 'Test Guardian',
+            guardianRelationship: 'Father',
+            guardianPhone: '9876543211',
+            guardianEmail: 'test.guardian@example.com'
+          }
+        : {})
     };
   }
 
@@ -85,9 +93,9 @@ describe('Coupon Flow Integration Tests', () => {
     assert.equal(res.body.success, true);
     assert.equal(res.body.freeRegistration, false);
     assert.ok(res.body.order.id);
-    assert.equal(res.body.order.amount, 9900);
-    assert.equal(res.body.registration.amountPaise, 9900);
-    assert.equal(res.body.registration.baseAmountPaise, 9900);
+    assert.equal(res.body.order.amount, 25000);
+    assert.equal(res.body.registration.amountPaise, 25000);
+    assert.equal(res.body.registration.baseAmountPaise, 25000);
     assert.equal(res.body.registration.discountPaise, 0);
     assert.equal(res.body.registration.coupon, null);
 
@@ -106,8 +114,8 @@ describe('Coupon Flow Integration Tests', () => {
     assert.equal(resValid.status, 200);
     assert.equal(resValid.body.success, true);
     assert.equal(resValid.body.valid, true);
-    assert.equal(resValid.body.quote.discountPaise, 3980); // 20% of 19900
-    assert.equal(resValid.body.quote.payableAmountPaise, 15920);
+    assert.equal(resValid.body.quote.discountPaise, 5000); // 20% of 25000
+    assert.equal(resValid.body.quote.payableAmountPaise, 20000);
 
     // Business rejection (wrong category) -> returns 200 valid: false
     const resWrongCat = await request(app)
@@ -136,11 +144,11 @@ describe('Coupon Flow Integration Tests', () => {
     assert.equal(res.status, 201);
     assert.equal(res.body.success, true);
     assert.equal(res.body.freeRegistration, false);
-    // Teen fee: 19900 -> 25% discount = 4975 -> payable = 14925
-    assert.equal(res.body.registration.baseAmountPaise, 19900);
-    assert.equal(res.body.registration.discountPaise, 4975);
-    assert.equal(res.body.registration.amountPaise, 14925);
-    assert.equal(res.body.order.amount, 14925);
+    // Teen fee: 25000 -> 25% discount = 6250 -> payable = 18750
+    assert.equal(res.body.registration.baseAmountPaise, 25000);
+    assert.equal(res.body.registration.discountPaise, 6250);
+    assert.equal(res.body.registration.amountPaise, 18750);
+    assert.equal(res.body.order.amount, 18750);
 
     createdRegistrationIds.push(res.body.registration.id);
 
@@ -150,7 +158,7 @@ describe('Coupon Flow Integration Tests', () => {
     });
     assert.ok(redemption);
     assert.equal(redemption.status, 'RESERVED');
-    assert.equal(redemption.discountPaise, 4975);
+    assert.equal(redemption.discountPaise, 6250);
 
     // Counter incremented to 1
     const updatedCoupon = await prisma.coupon.findUnique({ where: { id: coupon.id } });
@@ -267,7 +275,7 @@ describe('Coupon Flow Integration Tests', () => {
     assert.equal(res.body.order, null);
     assert.equal(res.body.registration.status, 'PAID');
     assert.equal(res.body.registration.amountPaise, 0);
-    assert.equal(res.body.registration.discountPaise, 29900);
+    assert.equal(res.body.registration.discountPaise, 25000);
 
     createdRegistrationIds.push(res.body.registration.id);
 
@@ -311,8 +319,8 @@ describe('Coupon Flow Integration Tests', () => {
 
     assert.equal(applyRes.status, 200);
     assert.equal(applyRes.body.success, true);
-    assert.equal(applyRes.body.registration.amountPaise, 15920);
-    assert.equal(applyRes.body.order.amount, 15920);
+    assert.equal(applyRes.body.registration.amountPaise, 20000);
+    assert.equal(applyRes.body.order.amount, 20000);
 
     const cpnAfterApply = await prisma.coupon.findUnique({ where: { id: coupon.id } });
     assert.equal(cpnAfterApply.redeemedCount, 1);
@@ -323,8 +331,8 @@ describe('Coupon Flow Integration Tests', () => {
 
     assert.equal(removeRes.status, 200);
     assert.equal(removeRes.body.success, true);
-    assert.equal(removeRes.body.registration.amountPaise, 19900);
-    assert.equal(removeRes.body.order.amount, 19900);
+    assert.equal(removeRes.body.registration.amountPaise, 25000);
+    assert.equal(removeRes.body.order.amount, 25000);
 
     const cpnAfterRemove = await prisma.coupon.findUnique({ where: { id: coupon.id } });
     assert.equal(cpnAfterRemove.redeemedCount, 0);

@@ -115,15 +115,18 @@ function sha256(value) {
  * the CSRF surface that None reopens; the double-submit token below covers it
  * either way.
  */
-function cookieOptions({ httpOnly = true, maxAge = SESSION_TTL_MS } = {}) {
+function cookieOptions({ httpOnly = true, maxAge = SESSION_TTL_MS, req } = {}) {
   const sameSite = env.ADMIN_COOKIE_SAMESITE;
+  const host = req ? (req.hostname || req.headers?.host || '') : '';
+  const isLocal = !req || host.includes('localhost') || host.includes('127.0.0.1') || env.NODE_ENV !== 'production';
+
   return {
     httpOnly,
     secure: sameSite === 'none' ? true : env.NODE_ENV === 'production',
     sameSite,
     maxAge,
     path: '/',
-    ...(env.ADMIN_COOKIE_DOMAIN ? { domain: env.ADMIN_COOKIE_DOMAIN } : {})
+    ...(!isLocal && env.ADMIN_COOKIE_DOMAIN ? { domain: env.ADMIN_COOKIE_DOMAIN } : {})
   };
 }
 
@@ -142,21 +145,21 @@ export async function createSession({ adminUserId, req, res }) {
     }
   });
 
-  res.cookie(SESSION_COOKIE, token, cookieOptions());
+  res.cookie(SESSION_COOKIE, token, cookieOptions({ req }));
   // Still set as a readable cookie, which is all a same-origin deployment
   // needs. It is NOT sufficient on its own when the dashboard is on a
   // different host from the API: this cookie is host-only to the API's domain,
   // so script on the dashboard's origin cannot read it. That is why the token
   // is also returned in the login and /auth/me response bodies, and why the
   // dashboard prefers the value it was handed over the one in the cookie.
-  res.cookie(CSRF_COOKIE, csrfToken, cookieOptions({ httpOnly: false }));
+  res.cookie(CSRF_COOKIE, csrfToken, cookieOptions({ httpOnly: false, req }));
 
   return { token, csrfToken };
 }
 
-export function clearSessionCookies(res) {
-  res.clearCookie(SESSION_COOKIE, { ...cookieOptions(), maxAge: undefined });
-  res.clearCookie(CSRF_COOKIE, { ...cookieOptions({ httpOnly: false }), maxAge: undefined });
+export function clearSessionCookies(res, req) {
+  res.clearCookie(SESSION_COOKIE, { ...cookieOptions({ req }), maxAge: undefined });
+  res.clearCookie(CSRF_COOKIE, { ...cookieOptions({ httpOnly: false, req }), maxAge: undefined });
 }
 
 export async function revokeSession(token) {

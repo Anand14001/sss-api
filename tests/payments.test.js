@@ -26,7 +26,11 @@ test('Payment Verification API', async (t) => {
         category: 'teen',
         dob: '2010-08-14', // Age 16 -> teen
         occupation: 'Student',
-        city: 'Salem'
+        city: 'Salem',
+        guardianName: 'Sundar S',
+        guardianRelationship: 'Father',
+        guardianPhone: '9876543211',
+        guardianEmail: 'sundar.s@example.com'
       });
 
     assert.strictEqual(regRes.status, 201);
@@ -133,6 +137,6 @@ test('Payment Verification API', async (t) => {
     assert.strictEqual(retryRes.status, 200);
     assert.strictEqual(retryRes.body.success, true);
     assert.notStrictEqual(retryRes.body.order.id, oldOrderId);
-    assert.strictEqual(retryRes.body.order.amount, 29900);
+    assert.strictEqual(retryRes.body.order.amount, 25000);
   });
 });

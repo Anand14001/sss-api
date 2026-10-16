@@ -1,7 +1,12 @@
+import crypto from 'node:crypto';
 import { prisma } from '../db/prisma.js';
 import { CATEGORIES } from '../config/event.js';
-import { getRazorpayClient } from './razorpay.js';
-import { sendPaymentConfirmationEmail } from './email.js';
+import { env } from '../config/env.js';
+import {
+  sendPaymentConfirmationEmail,
+  sendPaymentInvitationEmail,
+  sendRegistrationAcknowledgementEmail
+} from './email.js';
 import { validateCouponDefinition, validateBatchGenerationRequest } from './couponValidation.js';
 import { generateCouponBatch } from './couponCodes.js';
 import { releaseCouponForRegistration } from './coupons.js';
@@ -308,7 +313,21 @@ export async function resendConfirmationEmail({ reference, admin }) {
 
   if (!registration) throw badRequest('Registration not found.', 'NOT_FOUND', 404);
 
-  if (registration.status !== 'PAID') {
+  // If application is awaiting review or shortlisted, resend the registration acknowledgement
+  if (registration.status === 'PENDING_REVIEW' || registration.status === 'SHORTLISTED') {
+    const result = await sendRegistrationAcknowledgementEmail({ registration, force: true });
+    return {
+      reference,
+      recipientEmail: registration.email,
+      accepted: result.success === true || Boolean(result.messageId),
+      simulated: result.simulated === true,
+      error: result.error ?? null,
+      sentBy: admin.email,
+      emailType: 'REGISTRATION_ACKNOWLEDGEMENT'
+    };
+  }
+
+  if (registration.status !== 'PAID' && registration.status !== 'CONFIRMED') {
     throw badRequest(
       'A confirmation can only be sent for a registration whose payment is confirmed.',
       'REGISTRATION_NOT_CONFIRMED',
@@ -317,7 +336,7 @@ export async function resendConfirmationEmail({ reference, admin }) {
   }
 
   const payment = registration.payments[0];
-  if (!payment) {
+  if (!payment && registration.amountPaise > 0) {
     throw badRequest(
       'This registration is marked paid but has no captured payment on file. Reconcile it before sending a confirmation.',
       'NO_CAPTURED_PAYMENT',
@@ -325,7 +344,11 @@ export async function resendConfirmationEmail({ reference, admin }) {
     );
   }
 
-  const result = await sendPaymentConfirmationEmail({ registration, payment, force: true });
+  const result = await sendPaymentConfirmationEmail({
+    registration,
+    payment: payment || { amountPaise: 0, settlementMode: 'COMPLIMENTARY' },
+    force: true
+  });
 
   return {
     reference,
@@ -336,8 +359,29 @@ export async function resendConfirmationEmail({ reference, admin }) {
   };
 }
 
+export async function resendAcknowledgementEmail({ reference, admin }) {
+  const registration = await prisma.registration.findUnique({ where: { reference } });
+  if (!registration) throw badRequest('Registration not found.', 'NOT_FOUND', 404);
+
+  const result = await sendRegistrationAcknowledgementEmail({ registration, force: true });
+  return {
+    reference,
+    recipientEmail: registration.email,
+    accepted: result.success === true || Boolean(result.messageId),
+    simulated: result.simulated === true,
+    error: result.error ?? null,
+    sentBy: admin.email
+  };
+}
+
 /** Expected fee for a category, used to flag priced-differently registrations. */
-export function expectedFeePaise(categorySlug) {
+export async function expectedFeePaise(categorySlug) {
+  try {
+    const dbCat = await prisma.category.findUnique({ where: { slug: categorySlug } });
+    if (dbCat) return dbCat.feePaise;
+  } catch {
+    // fallback
+  }
   return CATEGORIES[categorySlug]?.feePaise ?? null;
 }
 
@@ -500,4 +544,483 @@ export async function archiveCouponBatchAction(batchId) {
 export async function sweepStaleReservationsAction({ ttlMinutes }) {
   return releaseStaleReservations({ prisma, ttlMinutes });
 }
+
+// -------------------------------------------------------- application review & shortlisting
+
+/**
+ * Shortlists an applicant.
+ * Does NOT generate a payment order or link. Shortlisting is a separate administrative decision.
+ */
+export async function shortlistApplicant({ reference, notes, admin }) {
+  const registration = await prisma.registration.findUnique({ where: { reference } });
+  if (!registration) throw badRequest('Application not found.', 'NOT_FOUND', 404);
+
+  if (registration.status === 'CONFIRMED' || registration.status === 'PAID') {
+    throw badRequest('This registration has already been confirmed and paid.', 'ALREADY_PAID', 400);
+  }
+  if (registration.status === 'CANCELLED') {
+    throw badRequest('Cannot shortlist a cancelled registration.', 'REGISTRATION_CANCELLED', 400);
+  }
+
+  const updated = await prisma.registration.update({
+    where: { id: registration.id },
+    data: {
+      status: 'SHORTLISTED',
+      reviewDecision: 'SHORTLISTED',
+      reviewNotes: notes ? String(notes).trim() : null,
+      reviewedBy: admin.email,
+      reviewedAt: new Date()
+    }
+  });
+
+  return {
+    reference: updated.reference,
+    fullName: updated.fullName,
+    status: updated.status,
+    reviewDecision: updated.reviewDecision,
+    reviewNotes: updated.reviewNotes,
+    reviewedBy: updated.reviewedBy,
+    reviewedAt: updated.reviewedAt
+  };
+}
+
+/**
+ * Rejects an applicant.
+ * Ensures any active or unfulfilled payment invitations are cancelled so no payment can be made.
+ */
+export async function rejectApplicant({ reference, reason, admin }) {
+  const registration = await prisma.registration.findUnique({ where: { reference } });
+  if (!registration) throw badRequest('Application not found.', 'NOT_FOUND', 404);
+
+  if (registration.status === 'CONFIRMED' || registration.status === 'PAID') {
+    throw badRequest('Cannot reject a confirmed and paid registration.', 'CANNOT_REJECT_PAID', 400);
+  }
+  if (registration.status === 'CANCELLED') {
+    throw badRequest('Cannot reject a cancelled registration.', 'REGISTRATION_CANCELLED', 400);
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    // Invalidate any active payment invitations so rejected applicant cannot pay
+    await tx.paymentInvitation.updateMany({
+      where: {
+        registrationId: registration.id,
+        status: { in: ['PENDING', 'SENT'] }
+      },
+      data: {
+        status: 'CANCELLED'
+      }
+    });
+
+    return tx.registration.update({
+      where: { id: registration.id },
+      data: {
+        status: 'REJECTED',
+        reviewDecision: 'REJECTED',
+        reviewNotes: reason ? String(reason).trim() : null,
+        reviewedBy: admin.email,
+        reviewedAt: new Date()
+      }
+    });
+  });
+
+  return {
+    reference: updated.reference,
+    fullName: updated.fullName,
+    status: updated.status,
+    reviewDecision: updated.reviewDecision,
+    reviewNotes: updated.reviewNotes,
+    reviewedBy: updated.reviewedBy,
+    reviewedAt: updated.reviewedAt
+  };
+}
+
+/**
+ * Explicit administrative trigger to send a payment link to a shortlisted applicant.
+ * Resolves authoritative fee from server config and generates unguessable invitation token.
+ */
+export async function sendPaymentInvitationAction({ reference, expiryDays = 7, force = false, admin }) {
+  const registration = await prisma.registration.findUnique({
+    where: { reference },
+    include: {
+      paymentInvitations: {
+        orderBy: { createdAt: 'desc' }
+      }
+    }
+  });
+  if (!registration) throw badRequest('Application not found.', 'NOT_FOUND', 404);
+
+  if (registration.status === 'CONFIRMED' || registration.status === 'PAID') {
+    throw badRequest('This registration has already been paid and confirmed.', 'ALREADY_PAID', 400);
+  }
+
+  if (registration.status === 'REJECTED') {
+    throw badRequest('Cannot send a payment link to a rejected applicant.', 'APPLICANT_REJECTED', 400);
+  }
+
+  if (registration.status === 'CANCELLED') {
+    throw badRequest('Cannot send a payment link to a cancelled registration.', 'REGISTRATION_CANCELLED', 400);
+  }
+
+  if (
+    registration.status !== 'SHORTLISTED' &&
+    registration.status !== 'PAYMENT_PENDING' &&
+    registration.status !== 'PAYMENT_FAILED' &&
+    registration.status !== 'PAYMENT_EXPIRED'
+  ) {
+    throw badRequest(
+      `Applicant must be shortlisted before sending a payment link. Current status: ${registration.status}.`,
+      'NOT_SHORTLISTED',
+      400
+    );
+  }
+
+  if (!registration.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(registration.email.trim())) {
+    throw badRequest('Applicant does not have a valid email address on record.', 'INVALID_EMAIL', 400);
+  }
+
+  // Derive authoritative fee from database categories (with static config fallback)
+  let authoritativeFeePaise;
+  let currency = 'INR';
+  const dbCategory = await prisma.category.findUnique({
+    where: { slug: registration.categorySlug }
+  });
+
+  if (dbCategory) {
+    authoritativeFeePaise = dbCategory.feePaise;
+    currency = dbCategory.currency || 'INR';
+  } else {
+    const category = CATEGORIES[registration.categorySlug];
+    if (!category) {
+      throw badRequest(`Unknown category: ${registration.categorySlug}`, 'UNKNOWN_CATEGORY', 400);
+    }
+    authoritativeFeePaise = category.feePaise;
+    currency = category.currency || 'INR';
+  }
+
+  // Check for existing unexpired invitation (idempotency safeguard)
+  const now = new Date();
+  const existingActive = registration.paymentInvitations.find(
+    (inv) => (inv.status === 'PENDING' || inv.status === 'SENT') && new Date(inv.expiresAt) > now
+  );
+
+  let invitation;
+  const baseUrl = (env.FRONTEND_URL || 'https://sss.eventsinfinite.com').replace(/\/$/, '');
+
+  // If existing link has a stale amount, do not silently reuse it! Recreate with new authoritative amount
+  const hasStaleAmount = existingActive && existingActive.amountPaise !== authoritativeFeePaise;
+
+  if (existingActive && !force && !hasStaleAmount) {
+    // Concurrency safe reuse of valid existing link
+    invitation = existingActive;
+  } else {
+    // Generate fresh high-entropy token
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + Math.max(1, parseInt(expiryDays, 10) || 7) * 24 * 60 * 60 * 1000);
+
+    invitation = await prisma.$transaction(async (tx) => {
+      // Invalidate any older active invitations if issuing a fresh link
+      if (existingActive) {
+        await tx.paymentInvitation.updateMany({
+          where: {
+            registrationId: registration.id,
+            status: { in: ['PENDING', 'SENT'] }
+          },
+          data: { status: 'CANCELLED' }
+        });
+      }
+
+      const inv = await tx.paymentInvitation.create({
+        data: {
+          registrationId: registration.id,
+          registrationReference: registration.reference,
+          token,
+          amountPaise: authoritativeFeePaise,
+          currency,
+          status: 'PENDING',
+          sentToEmail: registration.email.trim(),
+          expiresAt,
+          createdByAdminEmail: admin.email
+        }
+      });
+
+      await tx.registration.update({
+        where: { id: registration.id },
+        data: {
+          status: 'PAYMENT_PENDING',
+          amountPaise: authoritativeFeePaise
+        }
+      });
+
+      return inv;
+    });
+  }
+
+  const paymentUrl = `${baseUrl}/pay/${invitation.token}`;
+
+  // Send email asynchronously
+  const emailResult = await sendPaymentInvitationEmail({
+    registration,
+    invitation,
+    paymentUrl
+  });
+
+  return {
+    success: true,
+    invitationId: invitation.id,
+    token: invitation.token,
+    paymentUrl,
+    sentToEmail: registration.email,
+    amountPaise: invitation.amountPaise,
+    amountRupees: invitation.amountPaise / 100,
+    expiresAt: invitation.expiresAt,
+    status: emailResult.success ? 'SENT' : 'FAILED',
+    deliveryStatus: emailResult.success ? 'SENT' : 'FAILED',
+    emailError: emailResult.error || null,
+    isReused: Boolean(existingActive && !force)
+  };
+}
+
+/**
+ * Validates eligibility for sending a payment invitation according to existing business rules.
+ */
+export function checkPaymentInvitationEligibility(registration) {
+  if (!registration) {
+    return { eligible: false, reason: 'Registration not found', code: 'NOT_FOUND' };
+  }
+
+  if (registration.isConfirmed || registration.status === 'CONFIRMED' || registration.status === 'PAID') {
+    return { eligible: false, reason: 'Already paid and confirmed', code: 'ALREADY_PAID' };
+  }
+
+  if (registration.status === 'REJECTED' || registration.reviewDecision === 'REJECTED') {
+    return { eligible: false, reason: 'Application has been rejected', code: 'APPLICANT_REJECTED' };
+  }
+
+  if (registration.status === 'CANCELLED') {
+    return { eligible: false, reason: 'Registration has been cancelled', code: 'REGISTRATION_CANCELLED' };
+  }
+
+  const isShortlisted =
+    registration.reviewDecision === 'SHORTLISTED' ||
+    registration.status === 'SHORTLISTED' ||
+    registration.status === 'PAYMENT_PENDING' ||
+    registration.status === 'PAYMENT_FAILED' ||
+    registration.status === 'PAYMENT_EXPIRED';
+
+  if (!isShortlisted) {
+    return {
+      eligible: false,
+      reason: `Applicant must be shortlisted first (current: ${registration.status || 'PENDING_REVIEW'})`,
+      code: 'NOT_SHORTLISTED'
+    };
+  }
+
+  const email = registration.email ? String(registration.email).trim() : '';
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { eligible: false, reason: 'Applicant has no valid email address on record', code: 'INVALID_EMAIL' };
+  }
+
+  return { eligible: true, reason: null, code: 'ELIGIBLE' };
+}
+
+/**
+ * Previews bulk payment invitation eligibility and fees without sending emails or mutating state.
+ */
+export async function previewBulkPaymentInvitationsAction({ references = [] }) {
+  if (!Array.isArray(references) || references.length === 0) {
+    throw badRequest('Please provide a list of registration references to preview.', 'EMPTY_SELECTION', 400);
+  }
+
+  const uniqueReferences = [...new Set(references.map((r) => String(r || '').trim()).filter(Boolean))];
+  if (uniqueReferences.length === 0) {
+    throw badRequest('No valid registration references provided.', 'INVALID_REFERENCES', 400);
+  }
+
+  const registrations = await prisma.registration.findMany({
+    where: { reference: { in: uniqueReferences } },
+    include: {
+      paymentInvitations: {
+        where: {
+          status: { in: ['PENDING', 'SENT'] },
+          expiresAt: { gt: new Date() }
+        },
+        orderBy: { createdAt: 'desc' }
+      }
+    }
+  });
+
+  const dbCategories = await prisma.category.findMany();
+  const categoryMap = new Map(dbCategories.map((c) => [c.slug, c]));
+  const regMap = new Map(registrations.map((r) => [r.reference, r]));
+
+  const items = uniqueReferences.map((ref) => {
+    const reg = regMap.get(ref);
+    if (!reg) {
+      return {
+        reference: ref,
+        fullName: 'Unknown',
+        email: null,
+        categorySlug: null,
+        categoryName: 'Unknown',
+        amountRupees: 0,
+        amountPaise: 0,
+        status: 'NOT_FOUND',
+        eligible: false,
+        reason: 'Registration not found',
+        hasActiveInvitation: false
+      };
+    }
+
+    const dbCat = categoryMap.get(reg.categorySlug);
+    const staticCat = CATEGORIES[reg.categorySlug] || {};
+    const amountPaise = dbCat?.feePaise ?? staticCat.feePaise ?? 0;
+    const amountRupees = Math.floor(amountPaise / 100);
+    const categoryName = dbCat?.name || staticCat.name || reg.categorySlug;
+
+    const eligibility = checkPaymentInvitationEligibility(reg);
+    const hasActiveInvitation = reg.paymentInvitations && reg.paymentInvitations.length > 0;
+
+    return {
+      id: reg.id,
+      reference: reg.reference,
+      fullName: reg.fullName,
+      email: reg.email,
+      categorySlug: reg.categorySlug,
+      categoryName,
+      amountRupees,
+      amountPaise,
+      status: reg.status,
+      eligible: eligibility.eligible,
+      reason: eligibility.reason,
+      hasActiveInvitation,
+      existingInvitationAmountPaise: hasActiveInvitation ? reg.paymentInvitations[0].amountPaise : null
+    };
+  });
+
+  return {
+    success: true,
+    total: items.length,
+    eligibleCount: items.filter((i) => i.eligible).length,
+    ineligibleCount: items.filter((i) => !i.eligible).length,
+    items
+  };
+}
+
+/**
+ * Bulk administrative trigger to send payment links to multiple shortlisted applicants.
+ * Concurrency bounded (max 4 at a time) to prevent SMTP / gateway bursts.
+ * Partial failures do not roll back other successful invitations.
+ */
+export async function sendBulkPaymentInvitationsAction({ references = [], expiryDays = 7, force = false, admin }) {
+  if (!Array.isArray(references) || references.length === 0) {
+    throw badRequest('Please provide a list of registration references to process.', 'EMPTY_SELECTION', 400);
+  }
+
+  const uniqueReferences = [...new Set(references.map((r) => String(r || '').trim()).filter(Boolean))];
+  if (uniqueReferences.length === 0) {
+    throw badRequest('No valid registration references provided.', 'INVALID_REFERENCES', 400);
+  }
+
+  if (uniqueReferences.length > 100) {
+    throw badRequest('Maximum 100 registrations can be processed in a single bulk action.', 'BATCH_TOO_LARGE', 400);
+  }
+
+  const registrations = await prisma.registration.findMany({
+    where: { reference: { in: uniqueReferences } },
+    select: {
+      id: true,
+      reference: true,
+      fullName: true,
+      email: true,
+      categorySlug: true,
+      status: true,
+      reviewDecision: true
+    }
+  });
+
+  const regMap = new Map(registrations.map((r) => [r.reference, r]));
+
+  const CONCURRENCY = 4;
+  const results = [];
+
+  for (let i = 0; i < uniqueReferences.length; i += CONCURRENCY) {
+    const chunk = uniqueReferences.slice(i, i + CONCURRENCY);
+    const chunkResults = await Promise.all(
+      chunk.map(async (ref) => {
+        const reg = regMap.get(ref);
+        try {
+          const actionResult = await sendPaymentInvitationAction({
+            reference: ref,
+            expiryDays,
+            force,
+            admin
+          });
+
+          const isDeliveryFailed = actionResult.deliveryStatus === 'FAILED';
+
+          return {
+            id: reg?.id || null,
+            reference: ref,
+            fullName: reg?.fullName || 'Participant',
+            email: reg?.email || actionResult.sentToEmail,
+            categorySlug: reg?.categorySlug || null,
+            amountPaise: actionResult.amountPaise,
+            amountRupees: actionResult.amountRupees,
+            status: isDeliveryFailed ? 'EMAIL_FAILED' : actionResult.isReused ? 'REUSED' : 'SUCCESS',
+            deliveryStatus: actionResult.deliveryStatus,
+            isReused: actionResult.isReused,
+            reason: isDeliveryFailed
+              ? (actionResult.emailError || 'Payment link generated but email delivery failed.')
+              : actionResult.isReused
+              ? 'Active payment link reused and resent.'
+              : null,
+            paymentUrl: actionResult.paymentUrl,
+            invitationId: actionResult.invitationId,
+            expiresAt: actionResult.expiresAt
+          };
+        } catch (err) {
+          const isSkipped = [
+            'ALREADY_PAID',
+            'APPLICANT_REJECTED',
+            'REGISTRATION_CANCELLED',
+            'NOT_SHORTLISTED',
+            'INVALID_EMAIL'
+          ].includes(err.code);
+
+          return {
+            id: reg?.id || null,
+            reference: ref,
+            fullName: reg?.fullName || 'Participant',
+            email: reg?.email || null,
+            categorySlug: reg?.categorySlug || null,
+            amountPaise: null,
+            amountRupees: null,
+            status: isSkipped ? 'SKIPPED' : 'FAILED',
+            deliveryStatus: null,
+            isReused: false,
+            reason: err.message || 'Processing failed'
+          };
+        }
+      })
+    );
+
+    results.push(...chunkResults);
+  }
+
+  const summary = {
+    total: results.length,
+    sent: results.filter((r) => r.status === 'SUCCESS').length,
+    reused: results.filter((r) => r.status === 'REUSED').length,
+    skipped: results.filter((r) => r.status === 'SKIPPED').length,
+    emailFailed: results.filter((r) => r.status === 'EMAIL_FAILED').length,
+    failed: results.filter((r) => r.status === 'FAILED').length
+  };
+
+  return {
+    success: true,
+    summary,
+    results
+  };
+}
+
 

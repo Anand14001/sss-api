@@ -18,11 +18,18 @@ import {
   addNoteHandler,
   cancelRegistrationHandler,
   checkInHandler,
+  shortlistApplicantHandler,
+  rejectApplicantHandler,
+  sendPaymentInvitationHandler,
+  bulkPreviewPaymentInvitationsHandler,
+  bulkSendPaymentInvitationsHandler,
   listPaymentsHandler,
   reconcilePaymentHandler,
   listParticipantsHandler,
   duplicatesHandler,
   categoriesHandler,
+  updateCategoryFeeHandler,
+  updateCommonCategoryFeeHandler,
   contestHandler,
   emailDeliveriesHandler,
   resendEmailHandler,
@@ -85,10 +92,15 @@ router.get('/filters', filterOptionsHandler);
 
 // ------------------------------------------------------------ registrations
 router.get('/registrations', listRegistrationsHandler);
+router.post('/registrations/bulk-preview', bulkPreviewPaymentInvitationsHandler);
+router.post('/registrations/bulk-send-payment-links', bulkSendPaymentInvitationsHandler);
 router.get('/registrations/:reference', registrationDetailHandler);
 router.post('/registrations/:reference/notes', addNoteHandler);
 router.post('/registrations/:reference/cancel', cancelRegistrationHandler);
 router.post('/registrations/:reference/check-in', checkInHandler);
+router.post('/registrations/:reference/shortlist', shortlistApplicantHandler);
+router.post('/registrations/:reference/reject', rejectApplicantHandler);
+router.post('/registrations/:reference/send-payment-link', sendPaymentInvitationHandler);
 router.post('/registrations/:reference/resend-confirmation', resendEmailHandler);
 
 // ------------------------------------------------------------- participants
@@ -101,6 +113,10 @@ router.post('/payments/:orderId/reconcile', reconcilePaymentHandler);
 
 // --------------------------------------------------- categories and contest
 router.get('/categories', categoriesHandler);
+router.patch('/categories/:slug', updateCategoryFeeHandler);
+router.put('/categories/:slug', updateCategoryFeeHandler);
+router.post('/categories/common-amount', updateCommonCategoryFeeHandler);
+router.put('/categories/common-amount', updateCommonCategoryFeeHandler);
 router.get('/contest', contestHandler);
 
 // ------------------------------------------------------------ communication
@@ -134,8 +150,8 @@ router.get('/users', listAdminUsersHandler);
 router.post('/users', createAdminUserHandler);
 router.get('/users/:id', getAdminUserDetailHandler);
 router.patch('/users/:id', updateAdminUserHandler);
-router.patch('/users/:id/role', updateAdminRoleHandler);
+router.patch('/users/:id/role', requireSuperAdmin, updateAdminRoleHandler);
 router.post('/users/:id/reset-password', initiateAdminPasswordResetHandler);
-router.delete('/users/:id', deleteAdminUserHandler);
+router.delete('/users/:id', requireSuperAdmin, deleteAdminUserHandler);
 
 export default router;

@@ -103,5 +103,12 @@ export const AUDIT_ACTIONS = {
   USER_DEACTIVATED: 'user.deactivated',
   USER_PASSWORD_RESET_INITIATED: 'user.password_reset_initiated',
   USER_PASSWORD_RESET_COMPLETED: 'user.password_reset_completed',
-  USER_DELETED: 'user.deleted'
+  USER_DELETED: 'user.deleted',
+  APPLICATION_SHORTLISTED: 'application.shortlisted',
+  APPLICATION_REJECTED: 'application.rejected',
+  PAYMENT_INVITATION_SENT: 'payment.invitation.sent',
+  BULK_PAYMENT_INVITATIONS_SENT: 'payment.invitation.bulk_sent',
+  CATEGORY_FEE_UPDATED: 'category.fee.updated',
+  ALL_CATEGORIES_FEE_UPDATED: 'category.fee.updated_all'
 };
+

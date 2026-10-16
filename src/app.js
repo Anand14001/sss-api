@@ -48,7 +48,13 @@ app.use(
       'x-razorpay-signature',
       'x-request-id',
       // Double-submit CSRF token echoed by the admin dashboard.
-      'x-csrf-token'
+      'x-csrf-token',
+      'Idempotency-Key',
+      'x-idempotency-key',
+      'Cache-Control',
+      'cache-control',
+      'Pragma',
+      'pragma'
     ],
     // The dashboard reads the filename and row count off an export response.
     exposedHeaders: ['Content-Disposition', 'X-Row-Count', 'x-request-id']

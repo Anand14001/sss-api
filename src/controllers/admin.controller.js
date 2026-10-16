@@ -37,7 +37,12 @@ import {
   resumeCouponAction,
   deleteCouponAction,
   archiveCouponBatchAction,
-  sweepStaleReservationsAction
+  sweepStaleReservationsAction,
+  shortlistApplicant,
+  rejectApplicant,
+  sendPaymentInvitationAction,
+  previewBulkPaymentInvitationsAction,
+  sendBulkPaymentInvitationsAction
 } from '../services/adminActions.js';
 import { checkCouponsIntegrity } from '../services/coupons.js';
 import { buildCsv, csvFilename } from '../services/csv.js';
@@ -174,6 +179,109 @@ export async function checkInHandler(req, res, next) {
   }
 }
 
+export async function shortlistApplicantHandler(req, res, next) {
+  try {
+    const result = await shortlistApplicant({
+      reference: req.params.reference,
+      notes: req.body?.notes,
+      admin: req.admin
+    });
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.APPLICATION_SHORTLISTED,
+      entityType: 'registration',
+      entityId: req.params.reference,
+      metadata: { notes: req.body?.notes }
+    });
+    res.json({ success: true, applicant: result, registration: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function rejectApplicantHandler(req, res, next) {
+  try {
+    const result = await rejectApplicant({
+      reference: req.params.reference,
+      reason: req.body?.reason,
+      admin: req.admin
+    });
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.APPLICATION_REJECTED,
+      entityType: 'registration',
+      entityId: req.params.reference,
+      metadata: { reason: req.body?.reason }
+    });
+    res.json({ success: true, applicant: result, registration: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function sendPaymentInvitationHandler(req, res, next) {
+  try {
+    const result = await sendPaymentInvitationAction({
+      reference: req.params.reference,
+      expiryDays: req.body?.expiryDays,
+      force: req.body?.force === true,
+      admin: req.admin
+    });
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.PAYMENT_INVITATION_SENT,
+      entityType: 'registration',
+      entityId: req.params.reference,
+      metadata: {
+        sentToEmail: result.sentToEmail,
+        amountPaise: result.amountPaise,
+        deliveryStatus: result.deliveryStatus,
+        isReused: result.isReused
+      }
+    });
+    res.json({ success: true, invitation: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function bulkPreviewPaymentInvitationsHandler(req, res, next) {
+  try {
+    const references = req.body?.references || req.body?.ids || [];
+    const result = await previewBulkPaymentInvitationsAction({ references });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function bulkSendPaymentInvitationsHandler(req, res, next) {
+  try {
+    const references = req.body?.references || req.body?.ids || [];
+    const expiryDays = req.body?.expiryDays;
+    const force = req.body?.force === true;
+
+    const result = await sendBulkPaymentInvitationsAction({
+      references,
+      expiryDays,
+      force,
+      admin: req.admin
+    });
+
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.BULK_PAYMENT_INVITATIONS_SENT,
+      entityType: 'registration',
+      entityId: `BULK_${result.summary.total}`,
+      metadata: {
+        summary: result.summary,
+        requestedCount: references.length,
+        processedCount: result.results.length
+      }
+    });
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
 // -------------------------------------------------------------------- payments
 
 export async function listPaymentsHandler(req, res, next) {
@@ -236,6 +344,51 @@ export async function duplicatesHandler(req, res, next) {
  * and change nothing. Changing a fee is a code change plus a reseed, which the
  * response says plainly.
  */
+export function parseAndValidateFee(input) {
+  if (input === undefined || input === null || input === '') {
+    const err = new Error('Entry amount is required.');
+    err.status = 400;
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  const num = Number(input);
+  if (!Number.isFinite(num) || isNaN(num)) {
+    const err = new Error('Entry amount must be a valid number.');
+    err.status = 400;
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  if (num < 0) {
+    const err = new Error('Entry amount cannot be negative.');
+    err.status = 400;
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  if (num > 100000) {
+    const err = new Error('Entry amount cannot exceed ₹1,00,000.');
+    err.status = 400;
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  const str = String(input).trim();
+  const parts = str.split('.');
+  if (parts.length > 2 || (parts[1] && parts[1].length > 2)) {
+    const err = new Error('Entry amount cannot have more than 2 decimal places.');
+    err.status = 400;
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  const feePaise = Math.round(num * 100);
+  const feeRupees = feePaise / 100;
+
+  return { feePaise, feeRupees };
+}
+
 export async function categoriesHandler(req, res, next) {
   try {
     const [stored, counts, revenue] = await Promise.all([
@@ -250,39 +403,159 @@ export async function categoriesHandler(req, res, next) {
       `
     ]);
 
-    const categories = Object.values(CATEGORIES).map((cat) => {
-      const row = stored.find((s) => s.slug === cat.slug);
+    const categories = stored.map((row) => {
+      const config = CATEGORIES[row.slug] || {};
       const countFor = (status) =>
-        counts.find((c) => c.categorySlug === cat.slug && c.status === status)?._count._all ?? 0;
+        counts.find((c) => c.categorySlug === row.slug && c.status === status)?._count._all ?? 0;
 
       return {
-        slug: cat.slug,
-        name: cat.name,
-        formLabel: cat.formLabel,
-        minAge: cat.minAge,
-        maxAge: cat.maxAge,
-        feePaise: cat.feePaise,
-        currency: cat.currency,
-        isActive: row?.isActive ?? true,
-        // Flagged rather than silently reconciled: if these ever disagree the
-        // database was seeded from a different version of the config.
-        storedFeePaise: row?.feePaise ?? null,
-        inSync: row ? row.feePaise === cat.feePaise : false,
+        slug: row.slug,
+        name: row.name || config.name || row.slug,
+        formLabel: row.formLabel || config.formLabel || row.name,
+        minAge: row.minAge ?? config.minAge,
+        maxAge: row.maxAge ?? config.maxAge,
+        feePaise: row.feePaise,
+        feeRupees: row.feePaise / 100,
+        currency: row.currency || 'INR',
+        isActive: row.isActive,
+        storedFeePaise: row.feePaise,
+        inSync: true,
         counts: {
-          confirmed: countFor('PAID'),
-          awaitingPayment: countFor('AWAITING_PAYMENT'),
+          confirmed: countFor('PAID') + countFor('CONFIRMED'),
+          awaitingPayment: countFor('AWAITING_PAYMENT') + countFor('PAYMENT_PENDING'),
           cancelled: countFor('CANCELLED')
         },
-        revenuePaise: Number(revenue.find((r) => r.slug === cat.slug)?.revenue_paise ?? 0)
+        revenuePaise: Number(revenue.find((r) => r.slug === row.slug)?.revenue_paise ?? 0)
       };
     });
 
     res.json({
       success: true,
       categories,
-      editable: false,
-      sourceOfTruth: 'sss-api/src/config/event.js, mirrored into the categories table by prisma/seed.js',
-      note: 'Fees and age ranges are fixed in server configuration so the public checkout and the dashboard can never disagree. Changing one is a code change plus a reseed; existing registrations keep the amount they were charged.'
+      editable: true,
+      sourceOfTruth: 'Database (categories table), initialized from src/config/event.js and managed via Admin Dashboard',
+      note: 'Configured category entry amounts. Updates apply to future payment links and registrations.'
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateCategoryFeeHandler(req, res, next) {
+  try {
+    const { slug } = req.params;
+    const rawAmount =
+      req.body.amountRupees ??
+      req.body.amount ??
+      req.body.feeRupees ??
+      (req.body.amountPaise != null ? req.body.amountPaise / 100 : undefined) ??
+      (req.body.feePaise != null ? req.body.feePaise / 100 : undefined);
+
+    const { feePaise, feeRupees } = parseAndValidateFee(rawAmount);
+
+    const existing = await prisma.category.findUnique({
+      where: { slug }
+    });
+
+    if (!existing) {
+      const error = new Error(`Category '${slug}' not found.`);
+      error.status = 404;
+      error.code = 'CATEGORY_NOT_FOUND';
+      throw error;
+    }
+
+    const previousFeePaise = existing.feePaise;
+
+    const updated = await prisma.category.update({
+      where: { slug },
+      data: { feePaise }
+    });
+
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.CATEGORY_FEE_UPDATED,
+      entityType: 'Category',
+      entityId: slug,
+      metadata: {
+        categorySlug: slug,
+        categoryName: existing.name,
+        previousFeePaise,
+        newFeePaise: updated.feePaise,
+        previousFeeRupees: previousFeePaise / 100,
+        newFeeRupees: updated.feePaise / 100
+      }
+    });
+
+    res.json({
+      success: true,
+      category: {
+        ...updated,
+        feeRupees: updated.feePaise / 100
+      },
+      message: `Entry amount for ${existing.name} updated to ₹${feeRupees}.`
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateCommonCategoryFeeHandler(req, res, next) {
+  try {
+    const rawAmount =
+      req.body.amountRupees ??
+      req.body.amount ??
+      req.body.feeRupees ??
+      (req.body.amountPaise != null ? req.body.amountPaise / 100 : undefined) ??
+      (req.body.feePaise != null ? req.body.feePaise / 100 : undefined);
+
+    const { feePaise, feeRupees } = parseAndValidateFee(rawAmount);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const existingCategories = await tx.category.findMany({
+        orderBy: { minAge: 'asc' }
+      });
+
+      if (existingCategories.length === 0) {
+        const error = new Error('No categories found to update.');
+        error.status = 404;
+        error.code = 'CATEGORIES_EMPTY';
+        throw error;
+      }
+
+      await tx.category.updateMany({
+        data: { feePaise }
+      });
+
+      const updatedCategories = await tx.category.findMany({
+        orderBy: { minAge: 'asc' }
+      });
+
+      return { existingCategories, updatedCategories };
+    });
+
+    await auditFromRequest(req, {
+      action: AUDIT_ACTIONS.ALL_CATEGORIES_FEE_UPDATED,
+      entityType: 'Category',
+      entityId: 'ALL',
+      metadata: {
+        newFeePaise: feePaise,
+        newFeeRupees: feeRupees,
+        updatedCount: result.updatedCategories.length,
+        categories: result.existingCategories.map((c) => ({
+          slug: c.slug,
+          name: c.name,
+          previousFeePaise: c.feePaise,
+          newFeePaise: feePaise
+        }))
+      }
+    });
+
+    res.json({
+      success: true,
+      categories: result.updatedCategories.map((c) => ({
+        ...c,
+        feeRupees: c.feePaise / 100
+      })),
+      message: `Entry amount for all categories updated to ₹${feeRupees}.`
     });
   } catch (err) {
     next(err);
@@ -461,7 +734,9 @@ const REPORTS = {
       { label: 'City', value: (r) => r.city },
       { label: 'Occupation', value: (r) => r.occupation },
       { label: 'Guardian name', value: (r) => r.guardianName ?? '' },
+      { label: 'Guardian relationship', value: (r) => r.guardianRelationship ?? '' },
       { label: 'Guardian phone', value: (r) => r.guardianPhone ?? '' },
+      { label: 'Guardian email', value: (r) => r.guardianEmail ?? '' },
       { label: 'Base fee (INR)', value: (r) => rupees(r.baseAmountPaise ?? r.amountPaise) },
       { label: 'Coupon code', value: (r) => r.couponCode ?? '' },
       { label: 'Discount (INR)', value: (r) => rupees(r.discountPaise ?? 0) },
@@ -500,7 +775,9 @@ const REPORTS = {
       { label: 'Age on contest day', value: (r) => r.ageOnContest },
       { label: 'Phone', value: (r) => r.phone },
       { label: 'Guardian name', value: (r) => r.guardianName ?? '' },
+      { label: 'Guardian relationship', value: (r) => r.guardianRelationship ?? '' },
       { label: 'Guardian phone', value: (r) => r.guardianPhone ?? '' },
+      { label: 'Guardian email', value: (r) => r.guardianEmail ?? '' },
       { label: 'Checked in at', value: (r) => (r.checkedInAt ? r.checkedInAt.toISOString() : '') }
     ],
     source: (query) => streamRegistrations({ ...query, status: 'PAID' })
@@ -916,7 +1193,10 @@ export async function listAdminUsersHandler(req, res, next) {
         prisma.adminUser.findMany({
           where,
           select: SAFE_ADMIN_SELECT,
-          orderBy: { [sortBy]: sortDir },
+          orderBy: [
+            { [sortBy]: sortDir },
+            { id: 'desc' }
+          ],
           skip,
           take: limit
         }),
@@ -971,7 +1251,7 @@ export async function getAdminUserDetailHandler(req, res, next) {
       where: {
         OR: [{ entityType: 'admin_user', entityId: id }, { adminUserId: id }]
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 20
     });
 

@@ -2,6 +2,7 @@ import { prisma } from '../../src/db/prisma.js';
 import { seed } from '../../prisma/seed.js';
 import { setRazorpayClient } from '../../src/services/razorpay.js';
 import { env } from '../../src/config/env.js';
+import { CATEGORIES } from '../../src/config/event.js';
 
 export async function setupTestEnvironment() {
   process.env.NODE_ENV = 'test';
@@ -15,6 +16,14 @@ export async function setupTestEnvironment() {
 
   await prisma.$connect();
   await seed();
+
+  // In test environment, reset category fees to match authoritative CATEGORIES defaults
+  for (const cat of Object.values(CATEGORIES)) {
+    await prisma.category.updateMany({
+      where: { slug: cat.slug },
+      data: { feePaise: cat.feePaise }
+    });
+  }
 
   // Mock Razorpay client so tests do not make external network requests
   const mockRazorpay = {

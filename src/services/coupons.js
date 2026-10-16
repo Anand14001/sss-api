@@ -49,7 +49,7 @@ export async function findCouponByCode(prisma, rawCode) {
  * @param {string} [params.email]
  * @returns {Promise<{ valid: boolean, coupon?: any, quote?: any, isFree?: boolean, code?: string, error?: string }>}
  */
-export async function validateAndQuoteCoupon(prisma, { code, categorySlug, email = null }) {
+export async function validateAndQuoteCoupon(prisma, { code, categorySlug, email = null, baseAmountPaise = null }) {
   const normalisedCode = normaliseCouponCode(code);
   if (!normalisedCode) {
     return {
@@ -92,11 +92,25 @@ export async function validateAndQuoteCoupon(prisma, { code, categorySlug, email
     });
   }
 
+  // Resolve authoritative base amount from DB if not passed
+  let effectiveBaseAmount = baseAmountPaise;
+  if (effectiveBaseAmount === null || effectiveBaseAmount === undefined) {
+    try {
+      const dbCat = await prisma.category.findUnique({ where: { slug: categorySlug } });
+      if (dbCat) {
+        effectiveBaseAmount = dbCat.feePaise;
+      }
+    } catch {
+      // fallback
+    }
+  }
+
   const result = evaluateRedemptionRules({
     coupon,
     categorySlug,
     emailRedemptionCount: emailCount,
-    now: new Date()
+    now: new Date(),
+    baseAmountPaise: effectiveBaseAmount
   });
 
   if (!result.valid) {
@@ -199,7 +213,7 @@ export async function attachCouponToRegistration(tx, {
     where: {
       id: registration.id,
       couponId: null,
-      status: 'AWAITING_PAYMENT'
+      status: { in: ['AWAITING_PAYMENT', 'PAYMENT_PENDING', 'SHORTLISTED', 'PAYMENT_FAILED'] }
     },
     data: {
       couponId: coupon.id,
@@ -330,6 +344,17 @@ export async function releaseCouponForRegistration(tx, registrationId, reason = 
       couponId: null,
       couponCode: null,
       discountPaise: 0,
+      amountPaise: redemption.baseAmountPaise
+    }
+  });
+
+  // 4. Reset active payment invitations to base fee
+  await tx.paymentInvitation.updateMany({
+    where: {
+      registrationId,
+      status: { in: ['PENDING', 'SENT'] }
+    },
+    data: {
       amountPaise: redemption.baseAmountPaise
     }
   });

@@ -431,22 +431,114 @@ test('Admin API', async (t) => {
     assert.strictEqual(typeof res.body.system.integrations.smtp, 'boolean');
   });
 
-  // ------------------------------------------------- categories are read-only
-
-  await t.test('declares categories read-only and names the source of truth', async () => {
+  // ------------------------------------------------- entry amount management
+  let initialTeenFee;
+  await t.test('returns categories with entry amounts and source of truth', async () => {
     const res = await request(app)
       .get('/api/v1/admin/categories')
       .set('Cookie', [`sss_admin_session=${sessionCookie}`]);
 
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.body.editable, false);
+    assert.strictEqual(res.body.editable, true);
     assert.ok(res.body.sourceOfTruth.includes('config/event.js'));
     assert.strictEqual(res.body.categories.length, 3);
 
     const fees = Object.fromEntries(res.body.categories.map((c) => [c.slug, c.feePaise]));
-    assert.strictEqual(fees.kid, 9900);
-    assert.strictEqual(fees.teen, 19900);
-    assert.strictEqual(fees.adult, 29900);
+    assert.ok(fees.kid !== undefined);
+    assert.ok(fees.teen !== undefined);
+    assert.ok(fees.adult !== undefined);
+    initialTeenFee = fees.teen;
+  });
+
+  await t.test('updates individual category entry amount and validates input', async () => {
+    // 1. Rejects invalid or negative amounts
+    const negRes = await request(app)
+      .patch('/api/v1/admin/categories/kid')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: -50 });
+    assert.strictEqual(negRes.status, 400);
+
+    const nonNumRes = await request(app)
+      .patch('/api/v1/admin/categories/kid')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 'invalid' });
+    assert.strictEqual(nonNumRes.status, 400);
+
+    // 2. Rejects nonexistent category
+    const notFoundRes = await request(app)
+      .patch('/api/v1/admin/categories/nonexistent')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 150 });
+    assert.strictEqual(notFoundRes.status, 404);
+
+    // 3. Successfully updates Kids amount
+    const updateRes = await request(app)
+      .patch('/api/v1/admin/categories/kid')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 149 });
+    assert.strictEqual(updateRes.status, 200);
+    assert.strictEqual(updateRes.body.category.feePaise, 14900);
+    assert.strictEqual(updateRes.body.category.feeRupees, 149);
+
+    // 4. Verify in DB and GET endpoint
+    const getRes = await request(app)
+      .get('/api/v1/admin/categories')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`]);
+    const kidCat = getRes.body.categories.find((c) => c.slug === 'kid');
+    assert.strictEqual(kidCat.feePaise, 14900);
+
+    // Verify Teens and Adults were not changed
+    const teenCat = getRes.body.categories.find((c) => c.slug === 'teen');
+    assert.strictEqual(teenCat.feePaise, initialTeenFee);
+
+    // Restore Kids amount back to 250
+    await request(app)
+      .patch('/api/v1/admin/categories/kid')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 250 });
+  });
+
+  await t.test('updates common entry amount across all categories', async () => {
+    // 1. Rejects invalid input
+    const badRes = await request(app)
+      .post('/api/v1/admin/categories/common-amount')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: -10 });
+    assert.strictEqual(badRes.status, 400);
+
+    // 2. Applies common amount of 250
+    const applyRes = await request(app)
+      .post('/api/v1/admin/categories/common-amount')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 250 });
+    assert.strictEqual(applyRes.status, 200);
+    assert.strictEqual(applyRes.body.categories.length, 3);
+    for (const c of applyRes.body.categories) {
+      assert.strictEqual(c.feePaise, 25000);
+      assert.strictEqual(c.feeRupees, 250);
+    }
+
+    // 3. Verify audit log entry
+    const auditEntry = await prisma.auditLog.findFirst({
+      where: { action: 'category.fee.updated_all' },
+      orderBy: { createdAt: 'desc' }
+    });
+    assert.ok(auditEntry);
+    assert.strictEqual(auditEntry.entityId, 'ALL');
+
+    // 4. Restore default amounts: 250 for all
+    await request(app)
+      .post('/api/v1/admin/categories/common-amount')
+      .set('Cookie', [`sss_admin_session=${sessionCookie}`])
+      .set('X-CSRF-Token', csrfToken)
+      .send({ amountRupees: 250 });
   });
 
   // ------------------------------------------------------- password + logout

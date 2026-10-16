@@ -4,7 +4,7 @@ import { env } from '../config/env.js';
 import { prisma } from '../db/prisma.js';
 import { validateRegistrationPayload, isDeadlinePassed } from './validation.js';
 import { createRazorpayOrder, verifyCheckoutSignature } from './razorpay.js';
-import { sendPaymentConfirmationEmail } from './email.js';
+import { sendPaymentConfirmationEmail, sendRegistrationAcknowledgementEmail } from './email.js';
 import { quotePrice } from './pricing.js';
 import {
   validateAndQuoteCoupon,
@@ -52,35 +52,119 @@ export async function createRegistration(data) {
 
   const category = CATEGORIES[cleaned.category];
 
-  // 3. Prevent duplicate active registrations with the same email and category
-  const existing = await prisma.registration.findFirst({
+  // 3. Idempotency & Accidental Duplicate Submission Prevention
+  // Allows multiple participant registrations using the same email address.
+  // Protects against accidental retries of the same application submission using an idempotency key
+  // or a deterministic fingerprint of the participant's application payload.
+  const explicitIdempotencyKey =
+    typeof data.idempotencyKey === 'string' && data.idempotencyKey.trim()
+      ? data.idempotencyKey.trim()
+      : null;
+
+  const submissionFingerprint = crypto
+    .createHash('sha256')
+    .update(
+      [
+        cleaned.fullName.toLowerCase().trim(),
+        cleaned.email.toLowerCase().trim(),
+        cleaned.phone.trim(),
+        cleaned.dob,
+        cleaned.category,
+        cleaned.city.toLowerCase().trim(),
+        cleaned.occupation.toLowerCase().trim(),
+        (cleaned.guardianName || '').toLowerCase().trim(),
+        (cleaned.guardianRelationship || '').toLowerCase().trim(),
+        (cleaned.guardianPhone || '').trim(),
+        (cleaned.guardianEmail || '').toLowerCase().trim(),
+        (data.couponCode || '').toUpperCase().trim()
+      ].join('|')
+    )
+    .digest('hex');
+
+  const idempotencyKey = explicitIdempotencyKey || `fp_${submissionFingerprint}`;
+
+  // Check if this exact application was already submitted / retried
+  const existingByIdempotency = await prisma.registration.findFirst({
     where: {
-      email: cleaned.email,
-      categorySlug: cleaned.category,
-      dob: new Date(`${cleaned.dob}T00:00:00Z`),
-      status: 'PAID'
+      idempotencyKey,
+      status: { notIn: ['CANCELLED', 'REJECTED'] }
+    },
+    include: {
+      payments: { orderBy: { createdAt: 'desc' }, take: 1 }
     }
   });
 
-  if (existing) {
-    const error = new Error(
-      `A confirmed registration for ${cleaned.fullName} in category ${category.name} already exists under reference ${existing.reference}.`
-    );
-    error.status = 409;
-    error.code = 'DUPLICATE_REGISTRATION';
-    throw error;
+  if (existingByIdempotency) {
+    const existingCategory = CATEGORIES[existingByIdempotency.categorySlug] || category;
+    const existingAppData = {
+      id: existingByIdempotency.id,
+      reference: existingByIdempotency.reference,
+      fullName: existingByIdempotency.fullName,
+      email: existingByIdempotency.email,
+      phone: existingByIdempotency.phone,
+      category: existingByIdempotency.categorySlug,
+      categoryName: existingCategory.name,
+      baseAmountPaise: existingByIdempotency.baseAmountPaise ?? existingByIdempotency.amountPaise,
+      discountPaise: existingByIdempotency.discountPaise || 0,
+      amountPaise: existingByIdempotency.amountPaise,
+      amountRupees: existingByIdempotency.amountPaise / 100,
+      currency: existingByIdempotency.currency || 'INR',
+      status: existingByIdempotency.status,
+      coupon: existingByIdempotency.couponCode ? { code: existingByIdempotency.couponCode } : null,
+      createdAt: existingByIdempotency.createdAt
+    };
+
+    if (data.applicationMode === true || data.isApplication === true) {
+      return {
+        success: true,
+        application: existingAppData,
+        registration: existingAppData,
+        order: null,
+        freeRegistration: existingByIdempotency.amountPaise === 0,
+        paymentRequired: false,
+        duplicatePrevented: true
+      };
+    }
+
+    const latestPayment = existingByIdempotency.payments?.[0];
+    return {
+      success: true,
+      registration: existingAppData,
+      order: latestPayment
+        ? {
+            id: latestPayment.razorpayOrderId,
+            amount: latestPayment.amountPaise,
+            currency: latestPayment.currency
+          }
+        : null,
+      freeRegistration: existingByIdempotency.amountPaise === 0,
+      alreadyPaid: existingByIdempotency.status === 'PAID' || existingByIdempotency.status === 'CONFIRMED',
+      duplicatePrevented: true
+    };
   }
 
-  // 4. Coupon validation and pricing quote (D1, D2, D3)
+  // 4. Coupon validation and pricing quote (using DB as authoritative source of truth)
+  let dbCategory = null;
+  try {
+    dbCategory = await prisma.category.findUnique({
+      where: { slug: cleaned.category }
+    });
+  } catch (err) {
+    console.error('[REGISTRATION] DB category fee lookup error:', err.message);
+  }
+
+  const authoritativeFeePaise = dbCategory ? dbCategory.feePaise : CATEGORIES[cleaned.category]?.feePaise;
+
   let quote;
   let coupon = null;
   let isFree = false;
 
-  if (data.couponCode) {
+  if (data.couponCode && !data.applicationMode && !data.isApplication) {
     const valResult = await validateAndQuoteCoupon(prisma, {
       code: data.couponCode,
       categorySlug: cleaned.category,
-      email: cleaned.email
+      email: cleaned.email,
+      baseAmountPaise: authoritativeFeePaise
     });
 
     if (!valResult.valid) {
@@ -91,7 +175,10 @@ export async function createRegistration(data) {
     quote = valResult.quote;
     isFree = valResult.isFree;
   } else {
-    quote = quotePrice({ categorySlug: cleaned.category });
+    quote = quotePrice({
+      categorySlug: cleaned.category,
+      baseAmountPaise: authoritativeFeePaise
+    });
   }
 
   const registrationId = crypto.randomUUID();
@@ -118,12 +205,15 @@ export async function createRegistration(data) {
           occupation: cleaned.occupation,
           city: cleaned.city,
           guardianName: cleaned.guardianName || null,
+          guardianRelationship: cleaned.guardianRelationship || null,
           guardianPhone: cleaned.guardianPhone || null,
+          guardianEmail: cleaned.guardianEmail || null,
           baseAmountPaise: quote.baseAmountPaise,
           discountPaise: quote.discountPaise,
           amountPaise: 0,
           currency: quote.currency,
           status: 'PAID',
+          idempotencyKey,
           couponId: coupon?.id || null,
           couponCode: coupon?.code || null
         }
@@ -202,7 +292,107 @@ export async function createRegistration(data) {
     };
   }
 
-  // 6. Paid Path: Create Razorpay order first
+  // 6. Application-First Flow: Save application without payment or Razorpay order
+  if (data.applicationMode === true || data.isApplication === true) {
+    let reg;
+    try {
+      reg = await prisma.registration.create({
+        data: {
+          id: registrationId,
+          reference,
+          categorySlug: cleaned.category,
+          fullName: cleaned.fullName,
+          email: cleaned.email,
+          phone: cleaned.phone,
+          dob: new Date(`${cleaned.dob}T00:00:00Z`),
+          ageOnContest: cleaned.ageOnContest,
+          occupation: cleaned.occupation,
+          city: cleaned.city,
+          guardianName: cleaned.guardianName || null,
+          guardianRelationship: cleaned.guardianRelationship || null,
+          guardianPhone: cleaned.guardianPhone || null,
+          guardianEmail: cleaned.guardianEmail || null,
+          baseAmountPaise: quote.baseAmountPaise,
+          discountPaise: quote.discountPaise || 0,
+          amountPaise: quote.payableAmountPaise,
+          currency: quote.currency || 'INR',
+          status: 'PENDING_REVIEW',
+          idempotencyKey,
+          couponId: coupon?.id || null,
+          couponCode: coupon?.code || null
+        }
+      });
+    } catch (err) {
+      if (err.code === 'P2002') {
+        const concurrent = await prisma.registration.findFirst({
+          where: { idempotencyKey }
+        });
+        if (concurrent) {
+          const appData = {
+            id: concurrent.id,
+            reference: concurrent.reference,
+            fullName: concurrent.fullName,
+            email: concurrent.email,
+            phone: concurrent.phone,
+            category: concurrent.categorySlug,
+            categoryName: category.name,
+            baseAmountPaise: concurrent.baseAmountPaise ?? concurrent.amountPaise,
+            discountPaise: concurrent.discountPaise || 0,
+            amountPaise: concurrent.amountPaise,
+            amountRupees: concurrent.amountPaise / 100,
+            currency: concurrent.currency || 'INR',
+            status: concurrent.status,
+            coupon: concurrent.couponCode ? { code: concurrent.couponCode } : null,
+            createdAt: concurrent.createdAt
+          };
+          return {
+            success: true,
+            application: appData,
+            registration: appData,
+            order: null,
+            freeRegistration: false,
+            paymentRequired: false,
+            duplicatePrevented: true
+          };
+        }
+      }
+      throw err;
+    }
+
+    // Send registration acknowledgement email with rules PDF asynchronously
+    sendRegistrationAcknowledgementEmail({ registration: reg }).catch((err) => {
+      console.error('[ACKNOWLEDGEMENT EMAIL ERROR]', err.message);
+    });
+
+    const appData = {
+      id: reg.id,
+      reference: reg.reference,
+      fullName: reg.fullName,
+      email: reg.email,
+      phone: reg.phone,
+      category: reg.categorySlug,
+      categoryName: category.name,
+      baseAmountPaise: quote.baseAmountPaise,
+      discountPaise: quote.discountPaise || 0,
+      amountPaise: quote.payableAmountPaise,
+      amountRupees: quote.payableAmountPaise / 100,
+      currency: quote.currency || 'INR',
+      status: reg.status,
+      coupon: coupon ? { code: coupon.code, discountValue: coupon.discountValue } : null,
+      createdAt: reg.createdAt
+    };
+
+    return {
+      success: true,
+      application: appData,
+      registration: appData,
+      order: null,
+      freeRegistration: false,
+      paymentRequired: false
+    };
+  }
+
+  // 7. Legacy Immediate Checkout Path (used only when immediateCheckout is explicitly requested)
   let rzpOrder;
   try {
     rzpOrder = await createRazorpayOrder({
@@ -244,12 +434,15 @@ export async function createRegistration(data) {
           occupation: cleaned.occupation,
           city: cleaned.city,
           guardianName: cleaned.guardianName || null,
+          guardianRelationship: cleaned.guardianRelationship || null,
           guardianPhone: cleaned.guardianPhone || null,
+          guardianEmail: cleaned.guardianEmail || null,
           baseAmountPaise: quote.baseAmountPaise,
           discountPaise: quote.discountPaise,
           amountPaise: quote.payableAmountPaise,
           currency: quote.currency,
           status: 'AWAITING_PAYMENT',
+          idempotencyKey,
           couponId: coupon?.id || null,
           couponCode: coupon?.code || null
         }
@@ -339,7 +532,8 @@ export async function applyCouponToRegistration(reference, couponCode) {
     throw error;
   }
 
-  if (reg.status !== 'AWAITING_PAYMENT') {
+  const allowedStatuses = ['AWAITING_PAYMENT', 'PAYMENT_PENDING', 'SHORTLISTED', 'PAYMENT_FAILED'];
+  if (!allowedStatuses.includes(reg.status)) {
     throw couponError('COUPON_NOT_APPLICABLE_STATE', 'Coupons can only be applied to registrations awaiting payment.', 409);
   }
 
@@ -447,6 +641,14 @@ export async function applyCouponToRegistration(reference, couponCode) {
           status: 'CREATED'
         }
       });
+
+      await tx.paymentInvitation.updateMany({
+        where: {
+          registrationId: reg.id,
+          status: { in: ['PENDING', 'SENT'] }
+        },
+        data: { amountPaise: quote.payableAmountPaise }
+      });
     });
 
     return {
@@ -489,7 +691,7 @@ export async function removeCouponFromRegistration(reference) {
     throw error;
   }
 
-  if (reg.status !== 'AWAITING_PAYMENT') {
+  if (reg.status === 'PAID' || reg.status === 'CONFIRMED' || reg.status === 'CANCELLED' || reg.status === 'REJECTED') {
     throw couponError('COUPON_NOT_APPLICABLE_STATE', 'Cannot remove coupon from a paid or cancelled registration.', 409);
   }
 
@@ -561,9 +763,20 @@ export async function verifyPayment({
   registrationReference,
   razorpay_order_id,
   razorpay_payment_id,
-  razorpay_signature
+  razorpay_signature,
+  invitationToken
 }) {
-  if (!registrationReference || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+  let ref = registrationReference;
+  if (!ref && invitationToken) {
+    const inv = await prisma.paymentInvitation.findUnique({ where: { token: invitationToken } });
+    if (inv) ref = inv.registrationReference;
+  }
+  if (!ref && razorpay_order_id) {
+    const pmt = await prisma.payment.findUnique({ where: { razorpayOrderId: razorpay_order_id } });
+    if (pmt) ref = pmt.registrationReference;
+  }
+
+  if (!ref || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
     const error = new Error('Missing payment verification parameters.');
     error.status = 400;
     throw error;
@@ -592,7 +805,7 @@ export async function verifyPayment({
 
   // 2. Fetch registration and payment
   const registration = await prisma.registration.findUnique({
-    where: { reference: registrationReference }
+    where: { reference: ref }
   });
   if (!registration) {
     const error = new Error('Registration not found.');
@@ -609,8 +822,12 @@ export async function verifyPayment({
     throw error;
   }
 
-  // Idempotency: if already paid, return existing success
-  if (registration.status === 'PAID') {
+  const finalStatus = (registration.reviewDecision === 'SHORTLISTED' || registration.status === 'SHORTLISTED' || registration.status === 'PAYMENT_PENDING' || invitationToken)
+    ? 'CONFIRMED'
+    : 'PAID';
+
+  // Idempotency: if already paid or confirmed, return existing success
+  if (registration.status === 'PAID' || registration.status === 'CONFIRMED') {
     return {
       success: true,
       alreadyVerified: true,
@@ -618,7 +835,7 @@ export async function verifyPayment({
         reference: registration.reference,
         fullName: registration.fullName,
         category: registration.categorySlug,
-        status: registration.status,
+        status: finalStatus,
         baseAmountPaise: registration.baseAmountPaise ?? registration.amountPaise,
         discountPaise: registration.discountPaise || 0,
         amountRupees: registration.amountPaise / 100,
@@ -644,7 +861,19 @@ export async function verifyPayment({
     await tx.registration.update({
       where: { id: registration.id },
       data: {
-        status: 'PAID'
+        status: finalStatus
+      }
+    });
+
+    // Mark any active payment invitations as PAID
+    await tx.paymentInvitation.updateMany({
+      where: {
+        registrationId: registration.id,
+        status: { in: ['PENDING', 'SENT'] }
+      },
+      data: {
+        status: 'PAID',
+        paidAt: new Date()
       }
     });
 
@@ -668,7 +897,7 @@ export async function verifyPayment({
       fullName: registration.fullName,
       email: registration.email,
       category: registration.categorySlug,
-      status: 'PAID',
+      status: finalStatus,
       baseAmountPaise: registration.baseAmountPaise ?? registration.amountPaise,
       discountPaise: registration.discountPaise || 0,
       amountRupees: registration.amountPaise / 100,
@@ -718,8 +947,8 @@ export async function processWebhookEvent(payload) {
       return { received: true, warning: 'Amount mismatch' };
     }
 
-    // If already marked PAID, prevent duplicate processing or duplicate email
-    if (registration.status === 'PAID') {
+    // If already marked PAID or CONFIRMED, prevent duplicate processing or duplicate email
+    if (registration.status === 'PAID' || registration.status === 'CONFIRMED') {
       return { received: true, alreadyProcessed: true };
     }
 
@@ -732,10 +961,26 @@ export async function processWebhookEvent(payload) {
         }
       });
 
+      const finalStatus = (registration.reviewDecision === 'SHORTLISTED' || registration.status === 'SHORTLISTED' || registration.status === 'PAYMENT_PENDING')
+        ? 'CONFIRMED'
+        : 'PAID';
+
       await tx.registration.update({
         where: { id: registration.id },
         data: {
-          status: 'PAID'
+          status: finalStatus
+        }
+      });
+
+      // Mark payment invitations as PAID
+      await tx.paymentInvitation.updateMany({
+        where: {
+          registrationId: registration.id,
+          status: { in: ['PENDING', 'SENT'] }
+        },
+        data: {
+          status: 'PAID',
+          paidAt: new Date()
         }
       });
 
@@ -766,6 +1011,19 @@ export async function processWebhookEvent(payload) {
           failureReason: reason.slice(0, 255)
         }
       });
+
+      const pmt = await prisma.payment.findUnique({
+        where: { razorpayOrderId: orderId }
+      });
+      if (pmt) {
+        await prisma.registration.updateMany({
+          where: {
+            id: pmt.registrationId,
+            status: { notIn: ['CONFIRMED', 'PAID', 'CANCELLED'] }
+          },
+          data: { status: 'PAYMENT_FAILED' }
+        });
+      }
     }
 
     // Leave coupon reservation RESERVED per D4 table so user can retry with another card
@@ -785,6 +1043,10 @@ export async function getRegistrationStatus(reference) {
       payments: {
         orderBy: { createdAt: 'desc' },
         take: 1
+      },
+      paymentInvitations: {
+        orderBy: { createdAt: 'desc' },
+        take: 1
       }
     }
   });
@@ -796,14 +1058,22 @@ export async function getRegistrationStatus(reference) {
   }
 
   const latestPayment = reg.payments?.[0] || null;
+  const latestInvitation = reg.paymentInvitations?.[0] || null;
   const baseAmountPaise = reg.baseAmountPaise ?? reg.amountPaise;
   const discountPaise = reg.discountPaise || 0;
+  const isConfirmed = reg.status === 'CONFIRMED' || reg.status === 'PAID';
 
   return {
     reference: reg.reference,
     fullName: reg.fullName,
     category: reg.categorySlug,
     status: reg.status,
+    isConfirmed,
+    rawStatus: reg.status,
+    reviewDecision: reg.reviewDecision || null,
+    reviewNotes: reg.reviewNotes || null,
+    invitationStatus: latestInvitation ? (latestInvitation.deliveryStatus || latestInvitation.status) : null,
+    invitationToken: latestInvitation?.token || null,
     baseAmountPaise,
     discountPaise,
     amountPaise: reg.amountPaise,
@@ -811,7 +1081,7 @@ export async function getRegistrationStatus(reference) {
     discountRupees: discountPaise / 100,
     couponCode: reg.couponCode || null,
     currency: reg.currency,
-    paymentStatus: latestPayment ? latestPayment.status : null,
+    paymentStatus: isConfirmed ? 'CAPTURED' : (latestPayment ? latestPayment.status : null),
     orderId: latestPayment ? latestPayment.razorpayOrderId : null,
     paymentId: latestPayment?.razorpayPaymentId || null,
     createdAt: reg.createdAt
@@ -929,3 +1199,497 @@ export async function retryPayment(reference) {
     }
   };
 }
+
+/**
+ * Resolves invitation details for the participant payment page (/pay/:token).
+ * Rechecks expiry, current registration status, and ensures rejected or already
+ * confirmed participants cannot pay.
+ */
+export async function getInvitationByToken(token) {
+  if (!token || typeof token !== 'string') {
+    const error = new Error('Invalid invitation token.');
+    error.status = 400;
+    error.code = 'INVALID_TOKEN';
+    throw error;
+  }
+
+  const invitation = await prisma.paymentInvitation.findUnique({
+    where: { token: token.trim() },
+    include: {
+      registration: {
+        include: {
+          payments: {
+            orderBy: { createdAt: 'desc' },
+            take: 1
+          },
+          coupon: true
+        }
+      }
+    }
+  });
+
+  if (!invitation) {
+    const error = new Error('Payment invitation not found or invalid link.');
+    error.status = 404;
+    error.code = 'INVITATION_NOT_FOUND';
+    throw error;
+  }
+
+  const { registration } = invitation;
+
+  let dbCategory = null;
+  try {
+    dbCategory = await prisma.category.findUnique({
+      where: { slug: registration.categorySlug }
+    });
+  } catch (err) {
+    console.error('[INVITATION] DB category lookup error:', err.message);
+  }
+
+  const authoritativeFeePaise = dbCategory ? dbCategory.feePaise : (CATEGORIES[registration.categorySlug]?.feePaise || invitation.amountPaise);
+  const baseAmountPaise = registration.baseAmountPaise ?? authoritativeFeePaise;
+  const discountPaise = registration.discountPaise || 0;
+  const payableAmountPaise = registration.amountPaise ?? invitation.amountPaise;
+
+  const category = CATEGORIES[registration.categorySlug] || {
+    name: dbCategory?.name || registration.categorySlug,
+    formLabel: dbCategory?.name || registration.categorySlug,
+    feePaise: authoritativeFeePaise
+  };
+
+  const isConfirmed = registration.status === 'CONFIRMED' || registration.status === 'PAID';
+  const isRejected = registration.status === 'REJECTED' || invitation.status === 'CANCELLED';
+  const isCancelled = registration.status === 'CANCELLED';
+  const isExpired = new Date(invitation.expiresAt) < new Date() || invitation.status === 'EXPIRED';
+
+  // Determine effective invitation state
+  let effectiveStatus = invitation.status;
+  if (isConfirmed) {
+    effectiveStatus = 'PAID';
+  } else if (isRejected) {
+    effectiveStatus = 'REJECTED';
+  } else if (isCancelled) {
+    effectiveStatus = 'CANCELLED';
+  } else if (isExpired) {
+    effectiveStatus = 'EXPIRED';
+  } else if (registration.status === 'PAYMENT_FAILED') {
+    effectiveStatus = 'FAILED';
+  }
+
+  const latestPayment = registration.payments?.[0] || null;
+
+  const couponMeta = registration.couponId ? {
+    code: registration.couponCode || registration.coupon?.displayCode || registration.coupon?.code,
+    displayCode: registration.coupon?.displayCode || registration.couponCode || registration.coupon?.code,
+    discountValue: registration.coupon?.discountValue ?? (discountPaise > 0 && baseAmountPaise > 0 ? Math.round((discountPaise / baseAmountPaise) * 100) : 0),
+    discountType: registration.coupon?.discountType || 'PERCENT',
+    isFree: payableAmountPaise === 0
+  } : null;
+
+  return {
+    success: true,
+    invitation: {
+      id: invitation.id,
+      token: invitation.token,
+      reference: registration.reference,
+      fullName: registration.fullName,
+      email: registration.email,
+      category: registration.categorySlug,
+      categoryName: category.name,
+      categoryLabel: category.formLabel,
+      status: effectiveStatus,
+      amountPaise: payableAmountPaise,
+      amountRupees: payableAmountPaise / 100,
+      baseAmountPaise,
+      baseAmountRupees: baseAmountPaise / 100,
+      discountPaise,
+      discountRupees: discountPaise / 100,
+      coupon: couponMeta,
+      couponCode: couponMeta?.code || null,
+      isFree: payableAmountPaise === 0 && Boolean(registration.couponId),
+      currency: invitation.currency,
+      expiresAt: invitation.expiresAt,
+      isPayable: !isConfirmed && !isRejected && !isCancelled && !isExpired,
+      payable: !isConfirmed && !isRejected && !isCancelled && !isExpired,
+      razorpayKeyId: env.RAZORPAY_KEY_ID,
+      participant: {
+        reference: registration.reference,
+        fullName: registration.fullName,
+        email: registration.email,
+        category: registration.categorySlug,
+        categoryName: category.name,
+        categoryLabel: category.formLabel,
+        status: isConfirmed ? 'CONFIRMED' : registration.status
+      },
+      payment: latestPayment
+        ? {
+          id: latestPayment.id,
+          status: latestPayment.status,
+          paymentId: latestPayment.razorpayPaymentId || null,
+          orderId: latestPayment.razorpayOrderId
+        }
+        : null
+    }
+  };
+}
+
+/**
+ * Creates or retrieves a Razorpay checkout order for a valid, payable invitation.
+ */
+export async function createInvitationCheckoutOrder(token) {
+  const details = await getInvitationByToken(token);
+  const { invitation } = details;
+
+  if (!invitation.isPayable) {
+    const error = new Error(`Cannot initiate payment. Invitation is in status: ${invitation.status}`);
+    error.status = 400;
+    error.code = `INVITATION_${invitation.status}`;
+    throw error;
+  }
+
+  const reg = await prisma.registration.findUnique({
+    where: { reference: invitation.participant.reference }
+  });
+
+  // Handle 100% complimentary coupon without Razorpay order
+  if (invitation.amountPaise === 0 && (reg.couponId || invitation.isFree)) {
+    return {
+      success: true,
+      freeRegistration: true,
+      reference: reg.reference
+    };
+  }
+
+  // Create Razorpay Order
+  const rzpOrder = await createRazorpayOrder({
+    amountPaise: invitation.amountPaise,
+    currency: invitation.currency,
+    receipt: reg.reference,
+    notes: {
+      registrationReference: reg.reference,
+      invitationToken: invitation.token,
+      category: reg.categorySlug,
+      fullName: reg.fullName,
+      email: reg.email,
+      couponCode: reg.couponCode || ''
+    }
+  });
+
+  // Record payment in DB
+  await prisma.payment.create({
+    data: {
+      registrationId: reg.id,
+      registrationReference: reg.reference,
+      razorpayOrderId: rzpOrder.id,
+      amountPaise: invitation.amountPaise,
+      currency: invitation.currency,
+      status: 'CREATED'
+    }
+  });
+
+  // Link order to invitation
+  await prisma.paymentInvitation.update({
+    where: { token: invitation.token },
+    data: {
+      razorpayOrderId: rzpOrder.id
+    }
+  });
+
+  return {
+    success: true,
+    order: {
+      id: rzpOrder.id,
+      amount: invitation.amountPaise,
+      currency: invitation.currency,
+      keyId: env.RAZORPAY_KEY_ID
+    },
+    reference: reg.reference
+  };
+}
+
+/**
+ * Applies a coupon to a pending payment invitation (/pay/:token).
+ */
+export async function applyCouponToInvitation(token, couponCode) {
+  if (!token || typeof token !== 'string') {
+    const error = new Error('Invalid invitation token.');
+    error.status = 400;
+    throw error;
+  }
+
+  const invitation = await prisma.paymentInvitation.findUnique({
+    where: { token: token.trim() },
+    include: {
+      registration: {
+        include: { coupon: true }
+      }
+    }
+  });
+
+  if (!invitation) {
+    const error = new Error('Payment invitation not found or invalid link.');
+    error.status = 404;
+    throw error;
+  }
+
+  const { registration } = invitation;
+
+  const isConfirmed = registration.status === 'CONFIRMED' || registration.status === 'PAID';
+  const isRejected = registration.status === 'REJECTED' || invitation.status === 'CANCELLED';
+  const isCancelled = registration.status === 'CANCELLED';
+  const isExpired = new Date(invitation.expiresAt) < new Date() || invitation.status === 'EXPIRED';
+
+  if (isConfirmed || isRejected || isCancelled || isExpired) {
+    throw couponError('INVITATION_NOT_PAYABLE', 'This payment invitation is no longer active or payable.', 409);
+  }
+
+  const allowedStatuses = ['PAYMENT_PENDING', 'SHORTLISTED', 'AWAITING_PAYMENT', 'PAYMENT_FAILED'];
+  if (!allowedStatuses.includes(registration.status)) {
+    throw couponError('COUPON_NOT_APPLICABLE_STATE', 'Coupons can only be applied to registrations awaiting payment.', 409);
+  }
+
+  if (registration.couponId) {
+    throw couponError('COUPON_ALREADY_APPLIED', 'A coupon is already applied to this payment invitation. Please remove it first.', 409);
+  }
+
+  let dbCategory = null;
+  try {
+    dbCategory = await prisma.category.findUnique({
+      where: { slug: registration.categorySlug }
+    });
+  } catch (err) {}
+
+  const authoritativeBasePaise = dbCategory ? dbCategory.feePaise : (registration.baseAmountPaise || invitation.amountPaise);
+
+  const valResult = await validateAndQuoteCoupon(prisma, {
+    code: couponCode,
+    categorySlug: registration.categorySlug,
+    email: registration.email,
+    baseAmountPaise: authoritativeBasePaise
+  });
+
+  if (!valResult.valid) {
+    throw couponError(valResult.code, valResult.error, 400);
+  }
+
+  const { coupon, quote, isFree } = valResult;
+
+  // 100% complimentary discount branch
+  if (isFree || quote.payableAmountPaise === 0) {
+    await prisma.$transaction(async (tx) => {
+      await attachCouponToRegistration(tx, {
+        coupon,
+        registration,
+        quote,
+        initialStatus: 'CONSUMED'
+      });
+
+      await tx.registration.update({
+        where: { id: registration.id },
+        data: {
+          status: 'CONFIRMED',
+          baseAmountPaise: quote.baseAmountPaise,
+          discountPaise: quote.discountPaise,
+          amountPaise: 0
+        }
+      });
+
+      await tx.paymentInvitation.update({
+        where: { id: invitation.id },
+        data: {
+          status: 'PAID',
+          paidAt: new Date(),
+          amountPaise: 0
+        }
+      });
+
+      await tx.payment.create({
+        data: {
+          registrationId: registration.id,
+          registrationReference: registration.reference,
+          razorpayOrderId: `FREE-INV-${invitation.token.slice(0, 16)}`,
+          amountPaise: 0,
+          currency: invitation.currency,
+          status: 'CAPTURED',
+          settlementMode: 'COMPLIMENTARY'
+        }
+      });
+    });
+
+    sendPaymentConfirmationEmail({
+      registration: {
+        ...registration,
+        couponCode: coupon.code,
+        discountPaise: quote.discountPaise,
+        baseAmountPaise: quote.baseAmountPaise,
+        amountPaise: 0
+      },
+      payment: { amountPaise: 0, settlementMode: 'COMPLIMENTARY' }
+    }).catch(e => console.error('[EMAIL ERROR]', e.message));
+
+    return {
+      success: true,
+      freeRegistration: true,
+      message: '100% complimentary coupon applied! Booking confirmed.',
+      invitation: {
+        reference: registration.reference,
+        status: 'CONFIRMED',
+        baseAmountPaise: quote.baseAmountPaise,
+        baseAmountRupees: quote.baseAmountPaise / 100,
+        discountPaise: quote.discountPaise,
+        discountRupees: quote.discountPaise / 100,
+        amountPaise: 0,
+        amountRupees: 0,
+        coupon: {
+          code: coupon.displayCode || coupon.code,
+          discountValue: coupon.discountValue,
+          discountType: coupon.discountType,
+          isFree: true
+        }
+      }
+    };
+  }
+
+  // Discount branch (payable > 0)
+  try {
+    await prisma.$transaction(async (tx) => {
+      await attachCouponToRegistration(tx, {
+        coupon,
+        registration,
+        quote,
+        initialStatus: 'RESERVED'
+      });
+
+      await tx.registration.update({
+        where: { id: registration.id },
+        data: {
+          baseAmountPaise: quote.baseAmountPaise,
+          discountPaise: quote.discountPaise,
+          amountPaise: quote.payableAmountPaise
+        }
+      });
+
+      await tx.paymentInvitation.update({
+        where: { id: invitation.id },
+        data: {
+          amountPaise: quote.payableAmountPaise
+        }
+      });
+    });
+
+    return {
+      success: true,
+      freeRegistration: false,
+      message: 'Coupon applied successfully.',
+      invitation: {
+        reference: registration.reference,
+        baseAmountPaise: quote.baseAmountPaise,
+        baseAmountRupees: quote.baseAmountPaise / 100,
+        discountPaise: quote.discountPaise,
+        discountRupees: quote.discountPaise / 100,
+        amountPaise: quote.payableAmountPaise,
+        amountRupees: quote.payableAmountPaise / 100,
+        coupon: {
+          code: coupon.displayCode || coupon.code,
+          discountValue: coupon.discountValue,
+          discountType: coupon.discountType,
+          isFree: false
+        }
+      }
+    };
+  } catch (err) {
+    await compensateCouponReservation(prisma, coupon.id, 'APPLY_COUPON_FAILED');
+    throw err;
+  }
+}
+
+/**
+ * Removes an applied coupon from a pending payment invitation.
+ */
+export async function removeCouponFromInvitation(token) {
+  if (!token || typeof token !== 'string') {
+    const error = new Error('Invalid invitation token.');
+    error.status = 400;
+    throw error;
+  }
+
+  const invitation = await prisma.paymentInvitation.findUnique({
+    where: { token: token.trim() },
+    include: { registration: true }
+  });
+
+  if (!invitation) {
+    const error = new Error('Payment invitation not found or invalid link.');
+    error.status = 404;
+    throw error;
+  }
+
+  const { registration } = invitation;
+
+  if (registration.status === 'PAID' || registration.status === 'CONFIRMED') {
+    throw couponError('COUPON_NOT_APPLICABLE_STATE', 'Cannot remove coupon from a completed registration.', 409);
+  }
+
+  if (!registration.couponId) {
+    return {
+      success: true,
+      message: 'No coupon applied.',
+      invitation: {
+        reference: registration.reference,
+        amountPaise: registration.amountPaise,
+        amountRupees: registration.amountPaise / 100
+      }
+    };
+  }
+
+  let dbCategory = null;
+  try {
+    dbCategory = await prisma.category.findUnique({
+      where: { slug: registration.categorySlug }
+    });
+  } catch (err) {}
+
+  const authoritativeBasePaise = dbCategory ? dbCategory.feePaise : (registration.baseAmountPaise || invitation.amountPaise);
+  const baseFee = registration.baseAmountPaise ?? authoritativeBasePaise;
+
+  await prisma.$transaction(async (tx) => {
+    await releaseCouponForRegistration(tx, registration.id, 'USER_REMOVED');
+
+    await tx.registration.update({
+      where: { id: registration.id },
+      data: {
+        baseAmountPaise: baseFee,
+        amountPaise: baseFee,
+        discountPaise: 0,
+        couponId: null,
+        couponCode: null
+      }
+    });
+
+    await tx.paymentInvitation.update({
+      where: { id: invitation.id },
+      data: {
+        amountPaise: baseFee
+      }
+    });
+  });
+
+  return {
+    success: true,
+    message: 'Coupon removed successfully.',
+    invitation: {
+      reference: registration.reference,
+      baseAmountPaise: baseFee,
+      baseAmountRupees: baseFee / 100,
+      discountPaise: 0,
+      discountRupees: 0,
+      amountPaise: baseFee,
+      amountRupees: baseFee / 100,
+      coupon: null
+    }
+  };
+}
+
+export const createApplication = (data) => createRegistration({ ...data, applicationMode: true });
+
+

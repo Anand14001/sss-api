@@ -1,4 +1,6 @@
-import { CATEGORIES, ALLOWED_OCCUPATIONS, EVENT_CONFIG } from '../config/event.js';
+import { CATEGORIES, ALLOWED_OCCUPATIONS, ALLOWED_GUARDIAN_RELATIONSHIPS, EVENT_CONFIG } from '../config/event.js';
+
+export { ALLOWED_GUARDIAN_RELATIONSHIPS };
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i;
 const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
@@ -170,17 +172,77 @@ export function validateRegistrationPayload(data = {}) {
     cleaned.city = city;
   }
 
-  // Optional guardian info (for minors)
-  if (data.guardianName && typeof data.guardianName === 'string') {
-    const gName = data.guardianName.trim();
-    if (gName.length >= 2 && gName.length <= 100) {
-      cleaned.guardianName = gName;
+  // Guardian details: mandatory for Junior and Teen (and any category with maxAge < 18)
+  const isMinorCategory =
+    categorySlug === 'kid' ||
+    categorySlug === 'teen' ||
+    Boolean(categoryConfig && categoryConfig.maxAge < 18);
+
+  if (isMinorCategory) {
+    // 1. Parent/Guardian Full Name
+    const rawGName = typeof data.guardianName === 'string' ? data.guardianName.trim() : '';
+    if (!rawGName) {
+      errors.guardianName = "Please enter the parent/guardian's full name.";
+    } else if (rawGName.length < 2 || rawGName.length > 100) {
+      errors.guardianName = 'Parent/guardian name must be between 2 and 100 characters.';
+    } else {
+      cleaned.guardianName = rawGName;
     }
-  }
-  if (data.guardianPhone && typeof data.guardianPhone === 'string') {
-    const gPhone = data.guardianPhone.trim();
-    if (isValidPhone(gPhone)) {
-      cleaned.guardianPhone = normalisePhone(gPhone);
+
+    // 2. Parent/Guardian Relationship to Participant
+    const rawGRel = typeof data.guardianRelationship === 'string' ? data.guardianRelationship.trim() : '';
+    if (!rawGRel) {
+      errors.guardianRelationship = 'Please select your relationship to the participant.';
+    } else if (!ALLOWED_GUARDIAN_RELATIONSHIPS.includes(rawGRel)) {
+      errors.guardianRelationship = 'Please select your relationship to the participant.';
+    } else {
+      cleaned.guardianRelationship = rawGRel;
+    }
+
+    // 3. Parent/Guardian Contact Number
+    const rawGPhone = typeof data.guardianPhone === 'string' ? data.guardianPhone.trim() : '';
+    if (!rawGPhone) {
+      errors.guardianPhone = 'Please enter a valid parent/guardian contact number.';
+    } else if (!isValidPhone(rawGPhone)) {
+      errors.guardianPhone = 'Please enter a valid parent/guardian contact number.';
+    } else {
+      cleaned.guardianPhone = normalisePhone(rawGPhone);
+    }
+
+    // 4. Parent/Guardian Email Address
+    const rawGEmail = typeof data.guardianEmail === 'string' ? data.guardianEmail.trim().toLowerCase() : '';
+    if (!rawGEmail) {
+      errors.guardianEmail = 'Please enter a valid parent/guardian email address.';
+    } else if (!EMAIL_REGEX.test(rawGEmail) || rawGEmail.length > 150) {
+      errors.guardianEmail = 'Please enter a valid parent/guardian email address.';
+    } else {
+      cleaned.guardianEmail = rawGEmail;
+    }
+  } else {
+    // Adult registration: guardian fields are optional; if provided, clean and store them safely
+    if (data.guardianName && typeof data.guardianName === 'string') {
+      const gName = data.guardianName.trim();
+      if (gName.length >= 2 && gName.length <= 100) {
+        cleaned.guardianName = gName;
+      }
+    }
+    if (data.guardianRelationship && typeof data.guardianRelationship === 'string') {
+      const gRel = data.guardianRelationship.trim();
+      if (ALLOWED_GUARDIAN_RELATIONSHIPS.includes(gRel)) {
+        cleaned.guardianRelationship = gRel;
+      }
+    }
+    if (data.guardianPhone && typeof data.guardianPhone === 'string') {
+      const gPhone = data.guardianPhone.trim();
+      if (isValidPhone(gPhone)) {
+        cleaned.guardianPhone = normalisePhone(gPhone);
+      }
+    }
+    if (data.guardianEmail && typeof data.guardianEmail === 'string') {
+      const gEmail = data.guardianEmail.trim().toLowerCase();
+      if (EMAIL_REGEX.test(gEmail) && gEmail.length <= 150) {
+        cleaned.guardianEmail = gEmail;
+      }
     }
   }
 

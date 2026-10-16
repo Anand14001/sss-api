@@ -13,17 +13,17 @@ import { CATEGORIES } from '../config/event.js';
  * @param {Object|null} [params.coupon]
  * @returns {{ baseAmountPaise: number, discountPaise: number, payableAmountPaise: number, currency: string }}
  */
-export function quotePrice({ categorySlug, coupon = null }) {
+export function quotePrice({ categorySlug, coupon = null, baseAmountPaise: overrideBase = null }) {
   const category = CATEGORIES[categorySlug];
-  if (!category) {
+  if (!category && overrideBase === null) {
     const error = new Error(`Unknown category: ${categorySlug}`);
     error.code = 'INVALID_CATEGORY';
     error.status = 400;
     throw error;
   }
 
-  const baseAmountPaise = category.feePaise;
-  const currency = category.currency || 'INR';
+  const baseAmountPaise = overrideBase !== null ? overrideBase : category.feePaise;
+  const currency = category?.currency || 'INR';
 
   if (!coupon) {
     return {

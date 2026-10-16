@@ -348,7 +348,8 @@ export function evaluateRedemptionRules({
   coupon,
   categorySlug,
   emailRedemptionCount = 0,
-  now = new Date()
+  now = new Date(),
+  baseAmountPaise = null
 }) {
   if (!coupon || coupon.isArchived) {
     return {
@@ -416,7 +417,7 @@ export function evaluateRedemptionRules({
   }
 
   // Quote price and check bounds
-  const quote = quotePrice({ categorySlug, coupon });
+  const quote = quotePrice({ categorySlug, coupon, baseAmountPaise });
 
   if (quote.payableAmountPaise === 0) {
     return {

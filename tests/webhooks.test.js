@@ -38,7 +38,11 @@ test('Razorpay Webhook Handler', async (t) => {
         category: 'kid',
         dob: '2015-02-10', // Age 11
         occupation: 'Student',
-        city: 'Salem'
+        city: 'Salem',
+        guardianName: 'Kumar Sr',
+        guardianRelationship: 'Father',
+        guardianPhone: '9876543211',
+        guardianEmail: 'kumar.sr@example.com'
       });
 
     const ref = regRes.body.registration.reference;
@@ -52,7 +56,7 @@ test('Razorpay Webhook Handler', async (t) => {
           entity: {
             id: paymentId,
             order_id: orderId,
-            amount: 9900,
+            amount: regRes.body.order.amount,
             currency: 'INR',
             status: 'captured'
           }

@@ -16,7 +16,18 @@ import { getEffectiveStatus } from './couponValidation.js';
  * attendance, qualification or results.
  */
 
-export const REGISTRATION_STATUSES = ['AWAITING_PAYMENT', 'PAID', 'CANCELLED'];
+export const REGISTRATION_STATUSES = [
+  'PENDING_REVIEW',
+  'SHORTLISTED',
+  'REJECTED',
+  'PAYMENT_PENDING',
+  'PAYMENT_FAILED',
+  'PAYMENT_EXPIRED',
+  'CONFIRMED',
+  'AWAITING_PAYMENT',
+  'PAID',
+  'CANCELLED'
+];
 export const PAYMENT_STATUSES = ['CREATED', 'CAPTURED', 'FAILED'];
 
 const MAX_PAGE_SIZE = 100;
@@ -58,12 +69,66 @@ export function buildRegistrationWhere(query = {}) {
     where.categorySlug = query.category;
   }
 
-  if (query.status && REGISTRATION_STATUSES.includes(query.status)) {
-    where.status = query.status;
+  // Application decision filter: SHORTLISTED, REJECTED, PENDING_REVIEW
+  if (query.decision) {
+    const dec = query.decision.toUpperCase();
+    if (dec === 'SHORTLISTED') {
+      and.push({
+        OR: [{ reviewDecision: 'SHORTLISTED' }, { status: 'SHORTLISTED' }]
+      });
+    } else if (dec === 'REJECTED') {
+      and.push({
+        OR: [{ reviewDecision: 'REJECTED' }, { status: 'REJECTED' }]
+      });
+    } else if (dec === 'PENDING_REVIEW') {
+      where.status = 'PENDING_REVIEW';
+    }
   }
 
-  if (query.paymentStatus && PAYMENT_STATUSES.includes(query.paymentStatus)) {
-    and.push({ payments: { some: { status: query.paymentStatus } } });
+  // Payment invitation status filter: SENT, FAILED, NOT_SENT
+  if (query.invitationStatus) {
+    const invStatus = query.invitationStatus.toUpperCase();
+    if (invStatus === 'SENT') {
+      and.push({ paymentInvitations: { some: { deliveryStatus: 'SENT' } } });
+    } else if (invStatus === 'FAILED') {
+      and.push({ paymentInvitations: { some: { deliveryStatus: 'FAILED' } } });
+    } else if (invStatus === 'NOT_SENT') {
+      and.push({ paymentInvitations: { none: {} } });
+    }
+  }
+
+  if (query.status && REGISTRATION_STATUSES.includes(query.status)) {
+    if (query.status === 'CONFIRMED') {
+      where.status = { in: ['CONFIRMED', 'PAID'] };
+    } else {
+      where.status = query.status;
+    }
+  }
+
+  if (query.paymentStatus) {
+    const ps = query.paymentStatus.toUpperCase();
+    if (ps === 'CONFIRMED' || ps === 'CAPTURED') {
+      and.push({
+        OR: [
+          { status: { in: ['CONFIRMED', 'PAID'] } },
+          { payments: { some: { status: 'CAPTURED' } } }
+        ]
+      });
+    } else if (ps === 'PENDING' || ps === 'CREATED') {
+      and.push({
+        OR: [
+          { status: { in: ['PAYMENT_PENDING', 'AWAITING_PAYMENT'] } },
+          { payments: { some: { status: 'CREATED' } } }
+        ]
+      });
+    } else if (ps === 'FAILED') {
+      and.push({
+        OR: [
+          { status: 'PAYMENT_FAILED' },
+          { payments: { some: { status: 'FAILED' } } }
+        ]
+      });
+    }
   }
 
   if (query.city) {
@@ -94,13 +159,20 @@ const SORTABLE = {
   status: 'status',
   city: 'city',
   amountPaise: 'amountPaise',
-  categorySlug: 'categorySlug'
+  categorySlug: 'categorySlug',
+  updatedAt: 'updatedAt'
 };
 
 function buildOrderBy(query = {}) {
   const field = SORTABLE[query.sort] || 'createdAt';
   const direction = query.order === 'asc' ? 'asc' : 'desc';
-  return { [field]: direction };
+  if (field === 'id') {
+    return [{ id: direction }];
+  }
+  return [
+    { [field]: direction },
+    { id: 'desc' }
+  ];
 }
 
 /** Shapes a registration row for a list view: no more personal data than the
@@ -108,6 +180,21 @@ function buildOrderBy(query = {}) {
  *  detail view, which is a deliberate single-record lookup. */
 function toListItem(reg) {
   const latestPayment = reg.payments?.[0] ?? null;
+  const latestInvitation = reg.paymentInvitations?.[0] ?? null;
+  const isConfirmed = reg.status === 'CONFIRMED' || reg.status === 'PAID';
+
+  let effectiveDecision = reg.reviewDecision || null;
+  if (!effectiveDecision) {
+    if (reg.status === 'SHORTLISTED') effectiveDecision = 'SHORTLISTED';
+    else if (reg.status === 'REJECTED') effectiveDecision = 'REJECTED';
+    else if (reg.status === 'PENDING_REVIEW') effectiveDecision = 'PENDING_REVIEW';
+  }
+
+  let effectiveInvitationStatus = 'NOT_SENT';
+  if (latestInvitation) {
+    effectiveInvitationStatus = latestInvitation.deliveryStatus || latestInvitation.status || 'SENT';
+  }
+
   return {
     id: reg.id,
     reference: reg.reference,
@@ -124,9 +211,18 @@ function toListItem(reg) {
     couponId: reg.couponId || null,
     currency: reg.currency,
     status: reg.status,
-    paymentStatus: latestPayment?.status ?? null,
+    isConfirmed,
+    rawStatus: reg.status,
+    reviewDecision: effectiveDecision,
+    reviewNotes: reg.reviewNotes || null,
+    reviewedBy: reg.reviewedBy || null,
+    reviewedAt: reg.reviewedAt || null,
+    invitationStatus: effectiveInvitationStatus,
+    invitationDeliveryStatus: latestInvitation?.deliveryStatus || null,
+    paymentStatus: isConfirmed ? 'CAPTURED' : (latestPayment?.status ?? (reg.status === 'PAYMENT_PENDING' ? 'PENDING' : null)),
     checkedInAt: reg.checkedInAt,
-    createdAt: reg.createdAt
+    createdAt: reg.createdAt,
+    updatedAt: reg.updatedAt
   };
 }
 
@@ -134,19 +230,37 @@ export async function listRegistrations(query = {}) {
   const where = buildRegistrationWhere(query);
   const { take, skip, page, pageSize } = clampPaging(query);
 
-  const [total, rows] = await Promise.all([
+  const [total, rows, countsByStatus, invitationsSent] = await Promise.all([
     prisma.registration.count({ where }),
     prisma.registration.findMany({
       where,
       orderBy: buildOrderBy(query),
       take,
       skip,
-      include: { payments: { orderBy: { createdAt: 'desc' }, take: 1 } }
-    })
+      include: {
+        payments: { orderBy: { createdAt: 'desc' }, take: 1 },
+        paymentInvitations: { orderBy: { createdAt: 'desc' }, take: 1 }
+      }
+    }),
+    prisma.registration.groupBy({ by: ['status'], _count: { _all: true } }),
+    prisma.paymentInvitation.count({ where: { deliveryStatus: 'SENT' } })
   ]);
+
+  const sc = (s) => countsByStatus.find((r) => r.status === s)?._count._all ?? 0;
+  const summary = {
+    total: countsByStatus.reduce((acc, c) => acc + c._count._all, 0),
+    pendingReview: sc('PENDING_REVIEW'),
+    shortlisted: sc('SHORTLISTED'),
+    rejected: sc('REJECTED'),
+    paymentPending: sc('PAYMENT_PENDING'),
+    awaitingPayment: sc('AWAITING_PAYMENT') + sc('PAYMENT_PENDING'),
+    confirmed: sc('PAID') + sc('CONFIRMED'),
+    paymentInvitationsSent: invitationsSent
+  };
 
   return {
     items: rows.map(toListItem),
+    summary,
     pagination: {
       page,
       pageSize,
@@ -156,6 +270,7 @@ export async function listRegistrations(query = {}) {
     }
   };
 }
+
 
 /**
  * Streams every row matching a filter in batches, for exports. Keyset paging on
@@ -169,10 +284,10 @@ export async function* streamRegistrations(query = {}, batchSize = 500) {
   for (;;) {
     const rows = await prisma.registration.findMany({
       where,
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: batchSize,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-      include: { payments: { orderBy: { createdAt: 'desc' }, take: 1 } }
+      include: { payments: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 1 } }
     });
 
     if (rows.length === 0) return;
@@ -186,8 +301,9 @@ export async function getRegistrationDetail(reference) {
   const reg = await prisma.registration.findUnique({
     where: { reference },
     include: {
-      payments: { orderBy: { createdAt: 'desc' } },
-      emailDeliveries: { orderBy: { createdAt: 'desc' } }
+      payments: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] },
+      emailDeliveries: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] },
+      paymentInvitations: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] }
     }
   });
 
@@ -198,20 +314,24 @@ export async function getRegistrationDetail(reference) {
     throw error;
   }
 
-  const [notes, auditTrail] = await Promise.all([
+  const [notes, auditTrail, dbCategory] = await Promise.all([
     prisma.adminNote.findMany({
       where: { registrationReference: reference },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 50
     }),
     prisma.auditLog.findMany({
       where: { entityType: 'registration', entityId: reference },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 50
+    }),
+    prisma.category.findUnique({
+      where: { slug: reg.categorySlug }
     })
   ]);
 
-  const category = CATEGORIES[reg.categorySlug] ?? null;
+  const staticCategory = CATEGORIES[reg.categorySlug] ?? null;
+  const category = dbCategory || staticCategory;
 
   return {
     reference: reg.reference,
@@ -223,7 +343,9 @@ export async function getRegistrationDetail(reference) {
     occupation: reg.occupation,
     city: reg.city,
     guardianName: reg.guardianName,
+    guardianRelationship: reg.guardianRelationship,
     guardianPhone: reg.guardianPhone,
+    guardianEmail: reg.guardianEmail,
     category: reg.categorySlug,
     categoryName: category?.name ?? reg.categorySlug,
     categoryLabel: category?.formLabel ?? null,
@@ -242,12 +364,35 @@ export async function getRegistrationDetail(reference) {
     expectedFeePaise: category?.feePaise ?? null,
     currency: reg.currency,
     status: reg.status,
+    isConfirmed: reg.status === 'PAID' || reg.status === 'CONFIRMED',
+    rawStatus: reg.status,
+    reviewDecision: reg.reviewDecision || null,
+    reviewNotes: reg.reviewNotes || null,
+    reviewedBy: reg.reviewedBy || null,
+    reviewedAt: reg.reviewedAt || null,
     cancelledAt: reg.cancelledAt,
     cancelReason: reg.cancelReason,
     checkedInAt: reg.checkedInAt,
     checkedInBy: reg.checkedInBy,
     createdAt: reg.createdAt,
     updatedAt: reg.updatedAt,
+    paymentInvitations: (reg.paymentInvitations || []).map((inv) => ({
+      id: inv.id,
+      token: inv.token,
+      amountPaise: inv.amountPaise,
+      amountRupees: inv.amountPaise / 100,
+      currency: inv.currency,
+      status: inv.status,
+      sentToEmail: inv.sentToEmail,
+      sentAt: inv.sentAt,
+      deliveryStatus: inv.deliveryStatus,
+      deliveryError: inv.deliveryError,
+      expiresAt: inv.expiresAt,
+      paidAt: inv.paidAt,
+      razorpayOrderId: inv.razorpayOrderId,
+      createdByAdminEmail: inv.createdByAdminEmail,
+      createdAt: inv.createdAt
+    })),
     payments: reg.payments.map(toPaymentItem),
     emailDeliveries: reg.emailDeliveries.map((d) => ({
       id: d.id,
@@ -335,26 +480,42 @@ export async function listPayments(query = {}) {
   const where = buildPaymentWhere(query);
   const { take, skip, page, pageSize } = clampPaging(query);
 
-  const [total, rows] = await Promise.all([
+  const sortField = query.sort && ['amountPaise', 'createdAt', 'updatedAt'].includes(query.sort)
+    ? query.sort
+    : 'createdAt';
+  const sortDir = query.order === 'asc' ? 'asc' : 'desc';
+
+  const [total, rows, dbCategories] = await Promise.all([
     prisma.payment.count({ where }),
     prisma.payment.findMany({
       where,
-      orderBy: { createdAt: query.order === 'asc' ? 'asc' : 'desc' },
+      orderBy: [
+        { [sortField]: sortDir },
+        { id: 'desc' }
+      ],
       take,
       skip,
       include: { registration: { select: { fullName: true, categorySlug: true, status: true } } }
-    })
+    }),
+    prisma.category.findMany()
   ]);
 
+  const catMap = Object.fromEntries(dbCategories.map((c) => [c.slug, c]));
+
   return {
-    items: rows.map((p) => ({
-      ...toPaymentItem(p),
-      participantName: p.registration?.fullName ?? null,
-      category: p.registration?.categorySlug ?? null,
-      categoryName: CATEGORIES[p.registration?.categorySlug]?.name ?? null,
-      registrationStatus: p.registration?.status ?? null,
-      expectedFeePaise: CATEGORIES[p.registration?.categorySlug]?.feePaise ?? null
-    })),
+    items: rows.map((p) => {
+      const slug = p.registration?.categorySlug;
+      const dbCat = slug ? catMap[slug] : null;
+      const staticCat = slug ? CATEGORIES[slug] : null;
+      return {
+        ...toPaymentItem(p),
+        participantName: p.registration?.fullName ?? null,
+        category: slug ?? null,
+        categoryName: dbCat?.name ?? staticCat?.name ?? null,
+        registrationStatus: p.registration?.status ?? null,
+        expectedFeePaise: dbCat?.feePaise ?? staticCat?.feePaise ?? null
+      };
+    }),
     pagination: {
       page,
       pageSize,
@@ -372,7 +533,7 @@ export async function* streamPayments(query = {}, batchSize = 500) {
   for (;;) {
     const rows = await prisma.payment.findMany({
       where,
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: batchSize,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
       include: { registration: { select: { fullName: true, categorySlug: true, email: true } } }
@@ -403,13 +564,15 @@ export async function getOverviewMetrics() {
     capturedRevenue,
     checkedIn,
     emailFailures,
-    discountSum
+    discountSum,
+    invitationsSentCount,
+    invitationsFailedCount
   ] = await Promise.all([
     prisma.registration.groupBy({ by: ['status'], _count: { _all: true } }),
     prisma.registration.groupBy({
       by: ['categorySlug'],
       _count: { _all: true },
-      where: { status: 'PAID' }
+      where: { status: { in: ['PAID', 'CONFIRMED'] } }
     }),
     prisma.payment.groupBy({ by: ['status'], _count: { _all: true } }),
     prisma.payment.aggregate({
@@ -420,9 +583,11 @@ export async function getOverviewMetrics() {
     prisma.registration.count({ where: { NOT: { checkedInAt: null } } }),
     prisma.emailDelivery.count({ where: { status: 'FAILED' } }),
     prisma.registration.aggregate({
-      where: { status: 'PAID' },
+      where: { status: { in: ['PAID', 'CONFIRMED'] } },
       _sum: { discountPaise: true }
-    })
+    }),
+    prisma.paymentInvitation.count({ where: { deliveryStatus: 'SENT' } }),
+    prisma.paymentInvitation.count({ where: { deliveryStatus: 'FAILED' } })
   ]);
 
   const statusCount = (status) =>
@@ -446,12 +611,24 @@ export async function getOverviewMetrics() {
   const collectedPaise = Number(capturedRevenue._sum.amountPaise ?? 0);
   const discountGivenPaise = Number(discountSum._sum.discountPaise ?? 0);
 
+  const confirmedCount = statusCount('PAID') + statusCount('CONFIRMED');
+  const awaitingPaymentCount = statusCount('AWAITING_PAYMENT') + statusCount('PAYMENT_PENDING');
+
   return {
     registrations: {
       total: totalRegistrations,
+      pendingReview: statusCount('PENDING_REVIEW'),
+      shortlisted: statusCount('SHORTLISTED'),
+      rejected: statusCount('REJECTED'),
+      paymentPending: statusCount('PAYMENT_PENDING'),
+      paymentFailed: statusCount('PAYMENT_FAILED'),
+      paymentExpired: statusCount('PAYMENT_EXPIRED'),
       confirmed: statusCount('PAID'),
-      awaitingPayment: statusCount('AWAITING_PAYMENT'),
-      cancelled: statusCount('CANCELLED')
+      confirmedPaid: statusCount('PAID') + statusCount('CONFIRMED'),
+      awaitingPayment: awaitingPaymentCount,
+      cancelled: statusCount('CANCELLED'),
+      paymentInvitationsSent: invitationsSentCount,
+      invitationEmailFailures: invitationsFailedCount
     },
     payments: {
       created: paymentCount('CREATED'),
@@ -484,6 +661,7 @@ export async function getOverviewMetrics() {
       checkedIn,
       emailFailures
     },
+
     event: {
       name: EVENT_CONFIG.name,
       dateDisplay: EVENT_CONFIG.dateDisplay,
@@ -552,9 +730,9 @@ export async function getTrends({ days = 30 } = {}) {
 
 export async function getRecentRegistrations(limit = 8) {
   const rows = await prisma.registration.findMany({
-    orderBy: { createdAt: 'desc' },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: Math.min(25, Math.max(1, limit)),
-    include: { payments: { orderBy: { createdAt: 'desc' }, take: 1 } }
+    include: { payments: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 1 } }
   });
   return rows.map(toListItem);
 }
@@ -695,7 +873,7 @@ export async function listAuditLogs(query = {}) {
 
   const [total, rows, actions] = await Promise.all([
     prisma.auditLog.count({ where }),
-    prisma.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, take, skip }),
+    prisma.auditLog.findMany({ where, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take, skip }),
     prisma.auditLog.groupBy({ by: ['action'], _count: { _all: true } })
   ]);
 
@@ -738,7 +916,7 @@ export async function listEmailDeliveries(query = {}) {
 
   const [total, rows, byStatus] = await Promise.all([
     prisma.emailDelivery.count({ where }),
-    prisma.emailDelivery.findMany({ where, orderBy: { createdAt: 'desc' }, take, skip }),
+    prisma.emailDelivery.findMany({ where, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take, skip }),
     prisma.emailDelivery.groupBy({ by: ['status'], _count: { _all: true } })
   ]);
 
@@ -847,14 +1025,14 @@ export async function listCoupons(query = {}) {
   if (and.length) where.AND = and;
 
   // Sorting
-  let orderBy = { createdAt: 'desc' };
+  let orderBy = [{ createdAt: 'desc' }, { id: 'desc' }];
   if (query.sort) {
     const dir = query.order === 'asc' ? 'asc' : 'desc';
-    if (query.sort === 'code') orderBy = { code: dir };
-    else if (query.sort === 'discount' || query.sort === 'discountValue') orderBy = { discountValue: dir };
-    else if (query.sort === 'usage' || query.sort === 'redeemedCount') orderBy = { redeemedCount: dir };
-    else if (query.sort === 'expiry' || query.sort === 'expiresAt') orderBy = { expiresAt: dir };
-    else if (query.sort === 'created' || query.sort === 'createdAt') orderBy = { createdAt: dir };
+    if (query.sort === 'code') orderBy = [{ code: dir }, { id: 'desc' }];
+    else if (query.sort === 'discount' || query.sort === 'discountValue') orderBy = [{ discountValue: dir }, { id: 'desc' }];
+    else if (query.sort === 'usage' || query.sort === 'redeemedCount') orderBy = [{ redeemedCount: dir }, { id: 'desc' }];
+    else if (query.sort === 'expiry' || query.sort === 'expiresAt') orderBy = [{ expiresAt: dir }, { id: 'desc' }];
+    else if (query.sort === 'created' || query.sort === 'createdAt') orderBy = [{ createdAt: dir }, { id: 'desc' }];
   }
 
   const [total, rows] = await Promise.all([
@@ -1056,7 +1234,7 @@ export async function getCouponDetail(id) {
 
   const recentRedemptions = await prisma.couponRedemption.findMany({
     where: { couponId: id },
-    orderBy: { createdAt: 'desc' },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: 10,
     include: {
       registration: {
@@ -1115,7 +1293,7 @@ export async function listCouponRedemptions(couponId, query = {}) {
     prisma.couponRedemption.count({ where }),
     prisma.couponRedemption.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take,
       skip,
       include: {
@@ -1166,7 +1344,7 @@ export async function* streamCoupons(query = {}, batchSize = 500) {
   for (;;) {
     const rows = await prisma.coupon.findMany({
       where,
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: batchSize,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {})
     });
@@ -1192,7 +1370,7 @@ export async function* streamCouponRedemptions(query = {}, batchSize = 500) {
   for (;;) {
     const rows = await prisma.couponRedemption.findMany({
       where,
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: batchSize,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
       include: { registration: { select: { fullName: true } } }

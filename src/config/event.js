@@ -3,10 +3,12 @@
  * 
  * Single source of truth for the Salem Star Speaker backend.
  * Fees are defined in integer paise for Razorpay:
- * - Junior (10–13 years) [kid]: ₹99 (9,900 paise)
- * - Teens (14–17 years) [teen]: ₹199 (19,900 paise)
- * - Adults (18+) [adult]: ₹299 (29,900 paise)
+ * - Junior (10–13 years) [kid]: ₹250 (25,000 paise)
+ * - Teens (14–17 years) [teen]: ₹250 (25,000 paise)
+ * - Adults (18+) [adult]: ₹250 (25,000 paise)
  */
+
+export const WHATSAPP_GROUP_INVITE_URL = 'https://chat.whatsapp.com/Jbsi0DQ7xFRDyi5ylydf15?s=sw&p=a&mlu=4&ilr=4';
 
 export const EVENT_CONFIG = {
   id: 'sss-2026',
@@ -30,7 +32,8 @@ export const EVENT_CONFIG = {
     { name: 'Tharu', phone: '7010713565', tel: '+917010713565' }
   ],
   prizes: 'Top 3 winners in each category',
-  prelims: 'Preliminary rounds may be conducted depending on participant numbers.'
+  prelims: 'Preliminary rounds may be conducted depending on participant numbers.',
+  whatsappGroupInviteUrl: WHATSAPP_GROUP_INVITE_URL
 };
 
 export const CATEGORIES = {
@@ -40,8 +43,8 @@ export const CATEGORIES = {
     formLabel: 'Junior (10-13 years)',
     minAge: 10,
     maxAge: 13,
-    feePaise: 9900,
-    feeRupees: 99,
+    feePaise: 25000,
+    feeRupees: 250,
     currency: 'INR'
   },
   teen: {
@@ -50,8 +53,8 @@ export const CATEGORIES = {
     formLabel: 'Teens (14-17 years)',
     minAge: 14,
     maxAge: 17,
-    feePaise: 19900,
-    feeRupees: 199,
+    feePaise: 25000,
+    feeRupees: 250,
     currency: 'INR'
   },
   adult: {
@@ -60,8 +63,8 @@ export const CATEGORIES = {
     formLabel: 'Adults (18+)',
     minAge: 18,
     maxAge: 99,
-    feePaise: 29900,
-    feeRupees: 299,
+    feePaise: 25000,
+    feeRupees: 250,
     currency: 'INR'
   }
 };
@@ -73,3 +76,11 @@ export const ALLOWED_OCCUPATIONS = [
   'Home Maker',
   'Others'
 ];
+
+export const ALLOWED_GUARDIAN_RELATIONSHIPS = [
+  'Mother',
+  'Father',
+  'Legal Guardian',
+  'Other'
+];
+
