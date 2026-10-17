@@ -50,6 +50,13 @@ router.delete('/invitations/:token/coupon', applyCouponLimiter, removeInvitation
 
 // Payments
 router.post('/payments/verify', paymentLimiter, verifyPaymentHandler);
+router.get('/payments/webhook', (req, res) => {
+  res.json({
+    success: true,
+    status: 'active',
+    message: 'Razorpay webhook listener is active. This endpoint accepts POST requests from Razorpay only.'
+  });
+});
 router.post('/payments/webhook', webhookHandler);
 
 export default router;
